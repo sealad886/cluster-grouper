@@ -1,0 +1,2683 @@
+--- a/API.md
++++ b/API.md
+@@ -4,7 +4,7 @@
+ 
+ ## Connect a client
+ 
+-1. Open **Integrations** in the Footage Review toolbar.
++1. Open **Footage Review → Settings → Integrations**.
+ 2. Choose a port, then click **Start API**. The default port is `8765`.
+ 3. Copy the endpoint and access token into your client.
+ 4. Keep Footage Review open while the client uses the API.
+--- a/Package.swift
++++ b/Package.swift
+@@ -5,5 +5,8 @@
+     name: "FootageReview",
+     platforms: [.macOS(.v26)],
+     products: [.executable(name: "FootageReview", targets: ["FootageReview"])],
+-    targets: [.executableTarget(name: "FootageReview")]
++    targets: [
++        .executableTarget(name: "FootageReview"),
++        .testTarget(name: "FootageReviewTests", dependencies: ["FootageReview"])
++    ]
+ )
+--- a/README.md
++++ b/README.md
+@@ -16,16 +16,31 @@
+ 
+ ## Run
+ 
+-Open `dist/Footage Review 1.2.app` in Finder. It uses the **Footage Review Library** folder beside the bundle. Keep the library folder with the app to retain scans, run state, groups, and notes.
++Open `dist/Footage Review 1.3.0.app` in Finder. It uses the **Footage Review Library** folder beside the bundle. Keep the library folder with the app to retain scans, run state, groups, and notes.
+ 
+-Before opening 1.2, pause any scan and quit older copies of Footage Review. Version 1.2 uses the same adjacent library and adopts completed clip receipts. Runs saved by 1.1 remain resumable. The initial build did not save its queue; choose its scope again to adopt its completed receipts. Use 1.2 for this library after enabling the API so older copies cannot discard its API metadata.
++Before opening 1.3, pause any scan and quit older copies of Footage Review. Version 1.3 uses the same adjacent library and adopts completed clip receipts. Runs saved by 1.1 remain resumable. The initial build did not save its queue; choose its scope again to adopt its completed receipts. Use the current app for this library after enabling the API so older copies cannot discard its API metadata.
+ 
+-Rebuild from this directory with `./script/build_and_run.sh`. Use `--build-only` to stage the bundle without opening it. The app uses the native macOS frameworks and requires macOS 14 or later on the build architecture.
++Rebuild from this directory with `./script/build_and_run.sh`. Use `--build-only` to stage the bundle without opening it. The app uses the native macOS frameworks and requires macOS 26 or later on the build architecture.
+ 
+ ## External review API
+ 
+-Open **Integrations** in the toolbar to start the authenticated local HTTP API. It exports paginated appearances with base64 JPEGs, stable appearance and clip IDs, camera/date metadata, and existing group membership. Your review client can return human-reviewed group assignments, which appear immediately in the Groups sidebar and persist in the library.
++Open **Footage Review → Settings → Integrations** to configure or manually start the authenticated local HTTP API. The **Cluster Faces** action starts it automatically when needed. It exports paginated appearances with base64 JPEGs, stable appearance and clip IDs, camera/date metadata, and existing group membership. Your review client can return human-reviewed group assignments, which appear immediately in the Groups sidebar and persist in the library.
+ 
+ Imports validate the library revision and all appearance IDs before a single atomic save. Repeating the same import ID and request adopts its saved receipt, including after relaunch. The first API start saves the original library metadata as `Library.before-API.json`; scan receipts and crops stay in place.
+ 
+ See [API.md](API.md) for endpoint schemas, browser-origin settings, curl examples, limits, and retry behavior. The API starts only when requested and listens on `127.0.0.1`; friends can review exports through your client and its chosen sharing workflow.
++
++
++## One-click facial clustering
++
++Click **Cluster Faces** in the toolbar or choose **Clustering → Cluster Faces**. The app starts its integration API, launches an owned Cluster Grouper backend, exports the configured detections, and starts local face-similarity clustering. You do not need to copy tokens, launch a terminal, or start a browser service. The backend uses the prepared Python environment and verified models in the repository selected under **Settings → Clustering**. Prepare that repository once with `make setup` and `make models` if needed.
++
++Settings are grouped into **General** (library location), **Clustering** (tool folder, model status, threshold, minimum size, exact date/source/camera scope and service controls), and **Integrations** (API port, optional browser origin and connection details). Clustering scope is independent of the main window filters and defaults to all detected appearances. Existing reviewed groups are excluded from new suggestions.
++
++Progress remains native, with pause/resume/cancel controls. Interrupted work is restored without credentials; click Resume to continue it. Completed results reopen by default. Use **Start New Clustering Run** for changed detections or settings. Closing Footage Review pauses active work and stops only its owned tool backend; unrelated services are not adopted or killed.
++
++Choose **Review Suggestions** to inspect crops, adjust membership, and edit labels/notes. Approve groups locally, preview the saved immutable import, then explicitly submit it. An uncertain save retries the same request. Groups remain suggestions until you approve and import them. Exports accept up to 50,000 appearances; each import retains API v1's 100-group, 10,000-assignment and 2 MiB bounds.
++
++Clustering state is stored under the active library's `Clustering` directory, including exported crops, embeddings and saved requests. No access token is persisted. Keep this private state with your library backup.
++
++For isolated validation, `FOOTAGE_REVIEW_LIBRARY` selects a separate library and `FOOTAGE_REVIEW_SKIP_SEED=1` skips prepared-library seeding. These launch overrides do not move or rewrite the ordinary library. On managed build hosts that reject SwiftPM's nested manifest sandbox, the build entrypoint accepts `FOOTAGE_REVIEW_DISABLE_PACKAGE_SANDBOX=1`; the default build keeps SwiftPM sandboxing enabled.
+--- a/Sources/FootageReview/App/FootageReviewApp.swift
++++ b/Sources/FootageReview/App/FootageReviewApp.swift
+@@ -2,15 +2,24 @@
+ import SwiftUI
+ 
+ @main
++@MainActor
+ struct FootageReviewApp: App {
+-    @State private var store = ReviewStore()
++    @NSApplicationDelegateAdaptor(ReviewAppDelegate.self) private var appDelegate
++    @State private var store = ReviewStore(libraryURL: Self.libraryOverride)
++    @State private var settings = ReviewSettings()
++    @State private var clustering = ClusteringCoordinator()
+ 
+     var body: some Scene {
+         WindowGroup("Footage Review") {
+-            ContentView(store: store)
++            ContentView(store: store, settings: settings, clustering: clustering)
+                 .frame(minWidth: 860, minHeight: 560)
+                 .task {
+-                    if store.clips.isEmpty { store.importPreparedLibrary() }
++                    appDelegate.configure(store: store, clustering: clustering)
++                    clustering.restore(store: store, settings: settings)
++                    if store.clips.isEmpty,
++                       ProcessInfo.processInfo.environment["FOOTAGE_REVIEW_SKIP_SEED"] != "1" {
++                        store.importPreparedLibrary()
++                    }
+                 }
+         }
+         .defaultSize(width: 1180, height: 780)
+@@ -31,6 +40,81 @@
+                     NSWorkspace.shared.activateFileViewerSelecting([store.libraryURL])
+                 }
+             }
++            CommandMenu("Clustering") {
++                Button("Cluster Faces") {
++                    Task { await clustering.start(store: store, settings: settings) }
++                }
++                .keyboardShortcut("k", modifiers: [.command, .shift])
++                .disabled(!canCluster)
++                Button("Start New Clustering Run") {
++                    Task { await clustering.startNewRun(store: store, settings: settings) }
++                }
++                .disabled(!canCluster || !clustering.hasSavedRun)
++                Divider()
++                Button("Pause Clustering") { Task { await clustering.pause() } }
++                    .disabled(!clustering.canPause)
++                Button("Resume Clustering") { Task { await clustering.resume() } }
++                    .disabled(!clustering.canResume)
++                Button("Cancel Clustering") { Task { await clustering.cancel() } }
++                    .disabled(!clustering.canCancel)
++            }
++        }
++        Settings {
++            ReviewSettingsView(store: store, settings: settings, clustering: clustering)
+         }
+     }
++
++    private var canCluster: Bool {
++        !clustering.isBusy && !store.isLoadingLibrary && !store.isImporting
++            && !store.isScanning && !store.appearances.isEmpty
++    }
++
++    private static var libraryOverride: URL? {
++        guard let path = ProcessInfo.processInfo.environment["FOOTAGE_REVIEW_LIBRARY"],
++              !path.isEmpty else { return nil }
++        return URL(fileURLWithPath: (path as NSString).expandingTildeInPath, isDirectory: true)
++    }
+ }
++
++@MainActor
++final class ReviewAppDelegate: NSObject, NSApplicationDelegate {
++    private weak var store: ReviewStore?
++    private weak var clustering: ClusteringCoordinator?
++    private var isTerminating = false
++
++    func configure(store: ReviewStore, clustering: ClusteringCoordinator) {
++        self.store = store
++        self.clustering = clustering
++    }
++
++    func applicationDidFinishLaunching(_ notification: Notification) {
++        NSApp.setActivationPolicy(.regular)
++        NSApp.activate(ignoringOtherApps: true)
++    }
++
++    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
++        guard !isTerminating else { return .terminateLater }
++        guard let clustering else { return .terminateNow }
++        isTerminating = true
++        if store?.isScanning == true { store?.pauseScan() }
++        Task { @MainActor in
++            await clustering.shutdown()
++            let deadline = Date().addingTimeInterval(15)
++            while store?.isScanning == true, Date() < deadline {
++                try? await Task.sleep(for: .milliseconds(100))
++            }
++            finishTermination(sender)
++        }
++        Task { @MainActor in
++            try? await Task.sleep(for: .seconds(20))
++            finishTermination(sender)
++        }
++        return .terminateLater
++    }
++
++    private func finishTermination(_ sender: NSApplication) {
++        guard isTerminating else { return }
++        isTerminating = false
++        sender.reply(toApplicationShouldTerminate: true)
++    }
++}
+--- /dev/null
++++ b/Sources/FootageReview/Models/ClusteringModels.swift
+@@ -0,0 +1,126 @@
++import Foundation
++
++indirect enum ClusterJSON: Codable, Sendable, Equatable {
++    case object([String: ClusterJSON]), array([ClusterJSON]), string(String), number(Double), bool(Bool), null
++
++    init(from decoder: any Decoder) throws {
++        let value = try decoder.singleValueContainer()
++        if value.decodeNil() { self = .null }
++        else if let item = try? value.decode(Bool.self) { self = .bool(item) }
++        else if let item = try? value.decode(String.self) { self = .string(item) }
++        else if let item = try? value.decode(Double.self) { self = .number(item) }
++        else if let item = try? value.decode([ClusterJSON].self) { self = .array(item) }
++        else { self = .object(try value.decode([String: ClusterJSON].self)) }
++    }
++
++    func encode(to encoder: any Encoder) throws {
++        var value = encoder.singleValueContainer()
++        switch self {
++        case .object(let item): try value.encode(item)
++        case .array(let item): try value.encode(item)
++        case .string(let item): try value.encode(item)
++        case .number(let item): try value.encode(item)
++        case .bool(let item): try value.encode(item)
++        case .null: try value.encodeNil()
++        }
++    }
++
++    var prettyPrinted: String {
++        let encoder = JSONEncoder()
++        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
++        guard let data = try? encoder.encode(self), let text = String(data: data, encoding: .utf8) else { return "{}" }
++        return text
++    }
++}
++
++struct ClusterGroup: Codable, Sendable, Identifiable {
++    let id: String
++    var name: String
++    var note: String
++    var appearanceIDs: [String]
++    var origin: String
++    var reviewed: Bool
++    var dirty: Bool
++    var similarity: Double?
++    enum CodingKeys: String, CodingKey {
++        case id, name, note, origin, reviewed, dirty, similarity
++        case appearanceIDs = "appearance_ids"
++    }
++}
++
++struct ClusterJob: Codable, Sendable, Identifiable {
++    let id: String
++    let workspaceID: String
++    let kind: String
++    let status: String
++    let phase: String
++    let completed: Int
++    let total: Int
++    let error: String?
++    var isActive: Bool { ["queued", "running", "paused"].contains(status) }
++    enum CodingKeys: String, CodingKey {
++        case id, kind, status, phase, completed, total, error
++        case workspaceID = "workspace_id"
++    }
++}
++
++struct ClusterSavedImport: Codable, Sendable, Identifiable {
++    let id: String
++    let status: String
++    let payload: ClusterJSON
++    let response: ClusterJSON?
++    let error: String?
++    let createdAt: String
++    var prettyPayload: String { payload.prettyPrinted }
++    enum CodingKeys: String, CodingKey {
++        case id, status, payload, response, error
++        case createdAt = "created_at"
++    }
++}
++
++struct ClusterWorkspace: Codable, Sendable, Identifiable {
++    let id: String
++    let name: String
++    let libraryID: String
++    let baseRevision: Int
++    let appearanceCount: Int
++    let exportComplete: Bool
++    let groups: [ClusterGroup]
++    let jobs: [ClusterJob]
++    let imports: [ClusterSavedImport]
++    enum CodingKeys: String, CodingKey {
++        case id, name, groups, jobs, imports
++        case libraryID = "library_id", baseRevision = "base_revision"
++        case appearanceCount = "appearance_count", exportComplete = "export_complete"
++    }
++}
++
++struct ClusterBackendStatus: Decodable, Sendable {
++    let connected: Bool
++    let sessionActive: Bool
++    let libraryID: String?
++    let modelsReady: Bool
++    let modelMessage: String
++    enum CodingKeys: String, CodingKey {
++        case connected
++        case sessionActive = "session_active", libraryID = "library_id"
++        case modelsReady = "models_ready", modelMessage = "model_message"
++    }
++}
++
++struct ClusterExportCreated: Decodable, Sendable {
++    let workspaceID: String
++    let jobID: String
++    enum CodingKeys: String, CodingKey { case workspaceID = "workspace_id", jobID = "job_id" }
++}
++struct ClusterJobCreated: Decodable, Sendable {
++    let jobID: String
++    enum CodingKeys: String, CodingKey { case jobID = "job_id" }
++}
++struct ClusterOK: Decodable, Sendable { let ok: Bool }
++
++struct ClusteringFailure: LocalizedError, Sendable {
++    let message: String
++    var errorDescription: String? { message }
++    init(_ message: String) { self.message = message }
++}
+--- /dev/null
++++ b/Sources/FootageReview/Models/ReviewSettings.swift
+@@ -0,0 +1,92 @@
++import Foundation
++import Observation
++
++enum ReviewSettingsTab: Hashable {
++    case general
++    case clustering
++    case integrations
++}
++
++@MainActor
++@Observable
++final class ReviewSettings {
++    @ObservationIgnored private let defaults: UserDefaults
++
++    var repositoryPath: String { didSet { defaults.set(repositoryPath, forKey: Key.repository) } }
++    var apiPort: Int { didSet { defaults.set(apiPort, forKey: Key.port) } }
++    var apiBrowserOrigin: String { didSet { defaults.set(apiBrowserOrigin, forKey: Key.origin) } }
++    var similarityThreshold: Double { didSet { defaults.set(similarityThreshold, forKey: Key.threshold) } }
++    var minimumClusterSize: Int { didSet { defaults.set(minimumClusterSize, forKey: Key.minimum) } }
++    var scopeDate: String { didSet { defaults.set(scopeDate, forKey: Key.scopeDate) } }
++    var scopeSource: String { didSet { defaults.set(scopeSource, forKey: Key.scopeSource) } }
++    var scopeCamera: String { didSet { defaults.set(scopeCamera, forKey: Key.scopeCamera) } }
++    var selectedTab = ReviewSettingsTab.general
++
++    private enum Key {
++        static let repository = "review.clustering.repositoryPath"
++        static let port = "review.settings.apiPort"
++        static let oldPort = "review.api.port"
++        static let oldPortBackup = "review.settings.migration.apiPort.v1"
++        static let origin = "review.api.browserOrigin"
++        static let threshold = "review.clustering.similarityThreshold"
++        static let minimum = "review.clustering.minimumClusterSize"
++        static let scopeDate = "review.clustering.scope.date"
++        static let scopeSource = "review.clustering.scope.source"
++        static let scopeCamera = "review.clustering.scope.camera"
++    }
++
++    init(defaults: UserDefaults = .standard) {
++        self.defaults = defaults
++        repositoryPath = defaults.string(forKey: Key.repository)
++            ?? FileManager.default.homeDirectoryForCurrentUser
++                .appendingPathComponent("zzApps/cluster-grouper").path
++        let oldPort = defaults.object(forKey: Key.oldPort)
++        let migratedPort = (oldPort as? String).flatMap(Int.init) ?? oldPort as? Int
++        let savedPort = defaults.object(forKey: Key.port) as? Int
++        let port = savedPort ?? migratedPort ?? 8765
++        apiPort = (1024...65535).contains(port) ? port : 8765
++        apiBrowserOrigin = defaults.string(forKey: Key.origin) ?? ""
++        let savedThreshold = defaults.object(forKey: Key.threshold) as? Double ?? 0.55
++        similarityThreshold = savedThreshold.isFinite && (0...1).contains(savedThreshold)
++            ? savedThreshold : 0.55
++        let savedMinimum = defaults.object(forKey: Key.minimum) as? Int ?? 2
++        minimumClusterSize = (2...100).contains(savedMinimum) ? savedMinimum : 2
++        scopeDate = defaults.string(forKey: Key.scopeDate) ?? ""
++        scopeSource = defaults.string(forKey: Key.scopeSource) ?? ""
++        scopeCamera = defaults.string(forKey: Key.scopeCamera) ?? ""
++
++        if savedPort == nil {
++            if let oldPort {
++                defaults.set(oldPort, forKey: Key.oldPortBackup)
++                defaults.removeObject(forKey: Key.oldPort)
++            }
++            defaults.set(apiPort, forKey: Key.port)
++        }
++    }
++
++    var repositoryURL: URL {
++        URL(fileURLWithPath: (repositoryPath as NSString).expandingTildeInPath)
++            .standardizedFileURL
++    }
++
++    var apiPortValue: UInt16? {
++        guard (1024...65535).contains(apiPort) else { return nil }
++        return UInt16(apiPort)
++    }
++
++    var apiOriginValue: String? {
++        let value = apiBrowserOrigin.trimmingCharacters(in: .whitespacesAndNewlines)
++        return value.isEmpty ? nil : value
++    }
++
++    var originValidationMessage: String? {
++        guard let value = apiOriginValue else { return nil }
++        guard let url = URLComponents(string: value),
++              ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
++              url.host != nil, url.user == nil, url.password == nil,
++              url.path.isEmpty, url.query == nil, url.fragment == nil else {
++            return "Use an exact browser origin, such as http://localhost:3000, without a path."
++        }
++        return nil
++    }
++}
+--- /dev/null
++++ b/Sources/FootageReview/Services/ClusteringAPIClient.swift
+@@ -0,0 +1,104 @@
++import Foundation
++
++private final class ClusteringSessionDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
++    func urlSession(_ session: URLSession, task: URLSessionTask,
++                    willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
++                    completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
++        completionHandler(nil)
++    }
++}
++
++private struct ClusteringAPIProblem: Decodable {
++    struct Detail: Decodable { let code: String; let message: String }
++    let detail: Detail
++}
++
++/// One in-memory cookie jar for this owned backend. Credentials never become URLs or files.
++@MainActor
++final class ClusteringAPIClient {
++    let endpoint: URL
++    private let session: URLSession
++
++    init(endpoint: URL, configuration: URLSessionConfiguration = .ephemeral) throws {
++        guard Self.validEndpoint(endpoint) else { throw ClusteringFailure("The tool did not provide a valid local endpoint.") }
++        self.endpoint = endpoint
++        configuration.httpShouldSetCookies = true
++        configuration.urlCache = nil
++        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
++        configuration.timeoutIntervalForRequest = 15
++        configuration.timeoutIntervalForResource = 30
++        configuration.connectionProxyDictionary = [:]
++        self.session = URLSession(configuration: configuration, delegate: ClusteringSessionDelegate(), delegateQueue: nil)
++    }
++
++    static func validEndpoint(_ url: URL) -> Bool {
++        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return false }
++        return components.scheme == "http" && components.host == "127.0.0.1"
++            && components.port.map { (1...65535).contains($0) } == true
++            && components.user == nil && components.password == nil
++            && components.query == nil && components.fragment == nil
++            && (components.path.isEmpty || components.path == "/")
++    }
++
++    static func segment(_ text: String) -> String {
++        var allowed = CharacterSet.urlPathAllowed
++        allowed.remove(charactersIn: "/?#%")
++        return text.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
++    }
++
++    func request<T: Decodable>(_ method: String, _ path: String, body: ClusterJSON? = nil,
++                               bootstrapToken: String? = nil) async throws -> T {
++        guard path.hasPrefix("/api/"), let url = URL(string: path, relativeTo: endpoint)?.absoluteURL,
++              url.host == endpoint.host, url.port == endpoint.port else {
++            throw ClusteringFailure("Invalid clustering request path.")
++        }
++        var request = URLRequest(url: url)
++        request.httpMethod = method
++        if path.hasSuffix("/control") { request.timeoutInterval = 5 }
++        request.setValue("application/json", forHTTPHeaderField: "Accept")
++        if method != "GET" {
++            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
++            request.httpBody = try JSONEncoder().encode(body ?? .object([:]))
++        }
++        if let bootstrapToken { request.setValue("Bearer \(bootstrapToken)", forHTTPHeaderField: "Authorization") }
++        let data: Data
++        let response: URLResponse
++        do { (data, response) = try await session.data(for: request) }
++        catch {
++            if Task.isCancelled { throw CancellationError() }
++            throw ClusteringFailure("The clustering tool could not be reached. Start or reconnect the tool, then retry.")
++        }
++        guard let http = response as? HTTPURLResponse, data.count <= 64 * 1024 * 1024 else {
++            throw ClusteringFailure("The clustering tool returned an invalid or oversized response.")
++        }
++        guard http.url?.host == endpoint.host, http.url?.port == endpoint.port else {
++            throw ClusteringFailure("The clustering tool redirected outside its local endpoint.")
++        }
++        guard (200...299).contains(http.statusCode) else {
++            if let issue = try? JSONDecoder().decode(ClusteringAPIProblem.self, from: data) {
++                throw ClusteringFailure("\(issue.detail.message.prefix(600)) (\(issue.detail.code.prefix(100)))")
++            }
++            throw ClusteringFailure("The clustering tool rejected the request (HTTP \(http.statusCode)).")
++        }
++        do { return try JSONDecoder().decode(T.self, from: data) }
++        catch { throw ClusteringFailure("The clustering tool response does not match its API contract.") }
++    }
++
++    func status() async throws -> ClusterBackendStatus { try await request("GET", "/api/status") }
++    func bootstrap(token: String) async throws -> ClusterBackendStatus {
++        try await request("POST", "/api/session", bootstrapToken: token)
++    }
++    func connect(endpoint: String, token: String) async throws -> ClusterBackendStatus {
++        try await request("POST", "/api/connect", body: .object(["endpoint": .string(endpoint), "token": .string(token)]))
++    }
++    func workspace(_ id: String) async throws -> ClusterWorkspace {
++        try await request("GET", "/api/workspaces/\(Self.segment(id))")
++    }
++    func job(_ id: String) async throws -> ClusterJob {
++        try await request("GET", "/api/jobs/\(Self.segment(id))")
++    }
++    func control(_ id: String, action: String) async throws -> ClusterJob {
++        try await request("POST", "/api/jobs/\(Self.segment(id))/control", body: .object(["action": .string(action)]))
++    }
++    func invalidate() { session.invalidateAndCancel() }
++}
+--- /dev/null
++++ b/Sources/FootageReview/Services/ClusteringCoordinator.swift
+@@ -0,0 +1,499 @@
++import Foundation
++import Observation
++
++private struct NativeClusteringRun: Codable {
++    var workspaceID: String
++    var jobID: String
++    var stage: String
++    var threshold: Double
++    var minimum: Int
++    var candidateIDs: [String] = []
++}
++
++/// Sequences the existing backend API; it never writes group data directly to the native library.
++@Observable
++@MainActor
++final class ClusteringCoordinator {
++    private(set) var statusText = "Ready to cluster detected appearances."
++    private(set) var completed = 0
++    private(set) var total = 0
++    private(set) var errorMessage: String?
++    private(set) var isBusy = false
++    private(set) var canPause = false
++    private(set) var canResume = false
++    private(set) var canCancel = false
++    private(set) var workspace: ClusterWorkspace?
++    private(set) var reviewGroups: [ClusterGroup] = []
++    private(set) var preparedImport: ClusterSavedImport?
++    private(set) var modelsReady = false
++    private(set) var modelMessage = "Checked when clustering starts."
++    private(set) var hasSavedRun = false
++
++    private(set) var isBackendRunning = false
++
++    private let backend = ManagedClusteringBackend()
++    private var client: ClusteringAPIClient?
++    private weak var store: ReviewStore?
++    private weak var settings: ReviewSettings?
++    private var run: NativeClusteringRun?
++    private var activeJob: ClusterJob?
++    private var generation = UUID()
++    private var shuttingDown = false
++    private var stoppingService = false
++    private var reviewing = false
++
++    init() {
++        backend.onExit = { [weak self] in
++            guard let self else { return }
++            self.isBackendRunning = false
++            if self.isBusy && !self.shuttingDown && !self.stoppingService {
++                self.errorMessage = "The clustering backend stopped. Saved work is retained; reconnect to resume."
++            }
++        }
++    }
++
++    private var dataDirectory: URL? { store?.libraryURL.appendingPathComponent("Clustering", isDirectory: true) }
++    private var receiptURL: URL? { dataDirectory?.appendingPathComponent("NativeRun.json") }
++
++    /// Restores only non-secret metadata. Opening the app does not launch Python or the API.
++    func restore(store: ReviewStore, settings: ReviewSettings) {
++        guard !isBusy else { return }
++        self.store = store
++        self.settings = settings
++        do {
++            run = try readRun()
++            hasSavedRun = run != nil
++            canResume = run.map { !["completed", "cancelled", "failed"].contains($0.stage) } ?? false
++            if hasSavedRun {
++                statusText = canResume ? "A saved clustering run is available to resume." : "Previous clustering results are available."
++            }
++        } catch { fail(error) }
++    }
++
++    func start(store: ReviewStore, settings: ReviewSettings) async {
++        guard !isBusy, !shuttingDown else { return }
++        self.store = store
++        self.settings = settings
++        do {
++            if run == nil { run = try readRun() }
++            if let run {
++                if run.stage == "completed" { await openSavedRun(store: store, settings: settings) }
++                else if !["failed", "cancelled"].contains(run.stage) {
++                    canResume = true
++                    await resume()
++                } else { await startNewRun(store: store, settings: settings) }
++            } else { await startNewRun(store: store, settings: settings) }
++        } catch { fail(error) }
++    }
++
++    func startNewRun(store: ReviewStore, settings: ReviewSettings) async {
++        guard !isBusy, !canResume, !shuttingDown else { return }
++        self.store = store
++        self.settings = settings
++        let operation = begin()
++        activeJob = nil
++        run = nil
++        defer { finish(operation) }
++        do {
++            guard !store.isLoadingLibrary, !store.isImporting, !store.isScanning else {
++                throw ClusteringFailure("Wait for library loading, importing and scanning to finish before clustering.")
++            }
++            guard !store.appearances.isEmpty else { throw ClusteringFailure("Scan clips to detect appearances before clustering.") }
++            try validate(settings)
++            let threshold = settings.similarityThreshold
++            let minimum = settings.minimumClusterSize
++            var exportBody: [String: ClusterJSON] = [:]
++            if !settings.scopeDate.isEmpty { exportBody["date"] = .string(settings.scopeDate) }
++            if !settings.scopeSource.isEmpty { exportBody["source"] = .string(settings.scopeSource) }
++            if !settings.scopeCamera.isEmpty { exportBody["camera"] = .string(settings.scopeCamera) }
++            try await ensureServices(connect: true, operation: operation)
++            guard let client else { throw ClusteringFailure("The clustering backend is unavailable.") }
++            guard modelsReady else { throw ClusteringFailure(modelMessage) }
++            try check(operation)
++            statusText = "Exporting detected appearances…"
++            let name = "Footage Review · \(Date.now.formatted(date: .abbreviated, time: .standard))"
++            exportBody["name"] = .string(name)
++            let created: ClusterExportCreated = try await client.request("POST", "/api/exports", body: .object(exportBody))
++            try check(operation)
++            run = NativeClusteringRun(workspaceID: created.workspaceID, jobID: created.jobID, stage: "export",
++                                      threshold: threshold, minimum: minimum)
++            workspace = nil
++            reviewGroups = []
++            preparedImport = nil
++            hasSavedRun = true
++            try persistRun()
++            try await drive(operation)
++        } catch { handle(error, operation: operation) }
++    }
++
++    func openSavedRun(store: ReviewStore, settings: ReviewSettings) async {
++        guard !isBusy, !shuttingDown else { return }
++        self.store = store
++        self.settings = settings
++        let operation = begin()
++        defer { finish(operation) }
++        do {
++            if run == nil { run = try readRun() }
++            guard let run else { throw ClusteringFailure("There is no saved clustering run for this library.") }
++            try await ensureServices(connect: false, operation: operation)
++            try await refreshWorkspace(operation)
++            try check(operation)
++            if run.stage == "completed" {
++                statusText = "\(reviewGroups.count.formatted()) suggested groups available for review."
++            } else if let saved = workspace?.jobs.first(where: { $0.id == run.jobID }) {
++                publish(saved)
++            }
++        } catch { handle(error, operation: operation) }
++    }
++
++    func pause() async {
++        guard canPause, let activeJob, let client, !reviewing else { return }
++        do {
++            let paused = try await client.control(activeJob.id, action: "pause")
++            generation = UUID()
++            publish(paused)
++            isBusy = false
++            try persistRun()
++        } catch { fail(error) }
++    }
++
++    func resume() async {
++        guard !isBusy, canResume, !shuttingDown, let store, settings != nil else { return }
++        let operation = begin()
++        defer { finish(operation) }
++        do {
++            guard !store.isLoadingLibrary, !store.isImporting, !store.isScanning else {
++                throw ClusteringFailure("Wait for the library to finish loading or scanning before resuming.")
++            }
++            if run == nil { run = try readRun() }
++            guard let run else { throw ClusteringFailure("There is no saved clustering job to resume.") }
++            try await ensureServices(connect: true, operation: operation)
++            guard let client else { throw ClusteringFailure("The clustering backend is unavailable.") }
++            let saved = try await client.job(run.jobID)
++            try check(operation)
++            if saved.status == "paused" {
++                _ = try await client.control(saved.id, action: "resume")
++            } else if ["cancelled", "failed"].contains(saved.status) {
++                publish(saved)
++                self.run?.stage = saved.status
++                try persistRun()
++                throw ClusteringFailure("This saved job is terminal. Start a new clustering run after reviewing its error.")
++            }
++            try check(operation)
++            canResume = false
++            try await drive(operation, resumeAdoptedCluster: true)
++        } catch { handle(error, operation: operation) }
++    }
++
++    func cancel() async {
++        guard canCancel, !reviewing, !shuttingDown else { return }
++        do {
++            if let activeJob, let client, activeJob.isActive {
++                let cancelled = try await client.control(activeJob.id, action: "cancel")
++                generation = UUID()
++                publish(cancelled)
++                run?.stage = "cancelled"
++                try persistRun()
++            } else {
++                generation = UUID()
++                await backend.stop()
++                isBackendRunning = backend.isRunning
++                client?.invalidate()
++                client = nil
++                statusText = "Clustering cancelled. Saved work is retained."
++                run?.stage = "cancelled"
++                try persistRun()
++            }
++            canPause = false
++            canResume = false
++            canCancel = false
++            isBusy = false
++            errorMessage = nil
++        } catch { fail(error) }
++    }
++
++    func saveReview(group: ClusterGroup, name: String, note: String, appearanceIDs: [String]) async {
++        guard !isBusy, !shuttingDown, let client, let workspace else { return }
++        let operation = begin(review: true)
++        defer { finish(operation) }
++        do {
++            guard let store, !store.isLoadingLibrary, !store.isImporting, !store.isScanning else {
++                throw ClusteringFailure("Wait for the library to finish loading before approving groups.")
++            }
++            let currentIDs = Set(store.appearances.map(\.id))
++            guard Set(appearanceIDs).isSubset(of: currentIDs) else {
++                throw ClusteringFailure("Some appearances are no longer available in the current library. Restore the source or start a fresh clustering run.")
++            }
++            let _: ClusterGroup = try await client.request("PATCH", "/api/workspaces/\(ClusteringAPIClient.segment(workspace.id))/groups/\(ClusteringAPIClient.segment(group.id))", body: .object([
++                "name": .string(name), "note": .string(note),
++                "appearance_ids": .array(appearanceIDs.map(ClusterJSON.string)), "reviewed": .bool(true),
++            ]))
++            try check(operation)
++            try await refreshWorkspace(operation)
++            statusText = "Group approved locally. Preview an import when review is complete."
++        } catch { handle(error, operation: operation) }
++    }
++
++    func unapproveReview(group: ClusterGroup) async {
++        guard !isBusy, !shuttingDown, group.reviewed, let client, let workspace else { return }
++        let operation = begin(review: true)
++        defer { finish(operation) }
++        do {
++            let _: ClusterGroup = try await client.request("PATCH", "/api/workspaces/\(ClusteringAPIClient.segment(workspace.id))/groups/\(ClusteringAPIClient.segment(group.id))", body: .object(["reviewed": .bool(false)]))
++            try check(operation)
++            try await refreshWorkspace(operation)
++            statusText = "Group marked unreviewed. It will be excluded from new imports."
++        } catch { handle(error, operation: operation) }
++    }
++
++    func prepareImport(reviewer: String) async {
++        guard !isBusy, !shuttingDown, let workspace else { return }
++        let operation = begin(review: true)
++        defer { finish(operation) }
++        do {
++            try await ensureServices(connect: true, operation: operation)
++            guard let client else { throw ClusteringFailure("The clustering backend is unavailable.") }
++            preparedImport = try await client.request("POST", "/api/workspaces/\(ClusteringAPIClient.segment(workspace.id))/imports", body: .object(["reviewer": .string(reviewer)]))
++            try check(operation)
++            try await refreshWorkspace(operation)
++            statusText = "Import saved. Inspect it before submitting."
++        } catch { handle(error, operation: operation) }
++    }
++
++    func submitPreparedImport() async {
++        guard !isBusy, !shuttingDown, let workspace, let preparedImport,
++              ["prepared", "uncertain"].contains(preparedImport.status) else { return }
++        let operation = begin(review: true)
++        defer { finish(operation) }
++        do {
++            try await ensureServices(connect: true, operation: operation)
++            guard let client else { throw ClusteringFailure("The clustering backend is unavailable.") }
++            self.preparedImport = try await client.request("POST", "/api/workspaces/\(ClusteringAPIClient.segment(workspace.id))/imports/\(ClusteringAPIClient.segment(preparedImport.id))/submit")
++            try check(operation)
++            try await refreshWorkspace(operation)
++            statusText = self.preparedImport?.status == "submitted" ? "Reviewed groups imported into Footage Review." : "Import needs attention. Keep and retry the saved request when appropriate."
++        } catch { handle(error, operation: operation) }
++    }
++
++    func dismissPreparedImport() { preparedImport = nil }
++
++    /// Settings stop is reusable; only application quit permanently closes this coordinator.
++    func stopService() async {
++        guard !shuttingDown, !stoppingService else { return }
++        stoppingService = true
++        defer { stoppingService = false }
++        await closeOwnedService()
++        modelsReady = false
++        modelMessage = "Checked when the clustering backend starts."
++        if backend.isRunning {
++            errorMessage = "The clustering backend is still stopping. Try again shortly."
++            statusText = "Waiting for the owned clustering backend to stop."
++        } else {
++            errorMessage = nil
++            statusText = "Clustering backend stopped. Saved work remains available."
++        }
++    }
++
++    func shutdown() async {
++        guard !shuttingDown else { return }
++        shuttingDown = true
++        await closeOwnedService()
++    }
++
++    private func closeOwnedService() async {
++        generation = UUID()
++        isBusy = true
++        if let activeJob, let client, ["queued", "running"].contains(activeJob.status) {
++            if let paused = try? await client.control(activeJob.id, action: "pause") {
++                publish(paused)
++                try? persistRun()
++            }
++        }
++        await backend.stop()
++        isBackendRunning = backend.isRunning
++        client?.invalidate()
++        client = nil
++        isBusy = false
++        reviewing = false
++        canPause = false
++        canCancel = false
++        canResume = run.map { !["completed", "cancelled", "failed"].contains($0.stage) } ?? false
++    }
++
++    private func begin(review: Bool = false) -> UUID {
++        generation = UUID()
++        isBusy = true
++        reviewing = review
++        errorMessage = nil
++        if !review { canCancel = true }
++        return generation
++    }
++
++    private func finish(_ operation: UUID) {
++        guard generation == operation else { return }
++        isBusy = false
++        reviewing = false
++        if activeJob?.status != "paused" { canCancel = false }
++    }
++
++    private func check(_ operation: UUID) throws {
++        guard operation == generation, !shuttingDown else { throw CancellationError() }
++        try Task.checkCancellation()
++    }
++
++    private func validate(_ settings: ReviewSettings) throws {
++        guard (1024...65535).contains(settings.apiPort), settings.similarityThreshold.isFinite,
++              (0...1).contains(settings.similarityThreshold), (2...100).contains(settings.minimumClusterSize) else {
++            throw ClusteringFailure("Check the API port, similarity threshold and minimum group size in Settings.")
++        }
++    }
++
++    private func ensureServices(connect: Bool, operation: UUID) async throws {
++        guard let store, let settings, let dataDirectory else { throw ClusteringFailure("The review library is unavailable.") }
++        try validate(settings)
++        if connect {
++            statusText = "Starting Footage Review's integration API…"
++            if !store.apiRunning, store.apiToken == nil {
++                let origin = settings.apiBrowserOrigin.trimmingCharacters(in: .whitespacesAndNewlines)
++                store.startAPI(port: UInt16(settings.apiPort), allowedOrigin: origin.isEmpty ? nil : origin)
++            }
++            let deadline = ContinuousClock.now.advanced(by: .seconds(10))
++            while !store.apiRunning {
++                try check(operation)
++                if store.apiToken == nil { throw ClusteringFailure(store.apiMessage ?? "Footage Review's integration API could not start.") }
++                guard ContinuousClock.now < deadline else { throw ClusteringFailure("Footage Review's API took too long to start. Check its port in Settings.") }
++                try await Task.sleep(for: .milliseconds(50))
++            }
++        }
++        statusText = "Starting the clustering backend…"
++        let root = settings.repositoryURL
++        let connection = try await backend.start(repository: root, dataDirectory: dataDirectory)
++        isBackendRunning = backend.isRunning
++        try check(operation)
++        if client?.endpoint != connection.endpoint {
++            client?.invalidate()
++            client = try ClusteringAPIClient(endpoint: connection.endpoint)
++        }
++        guard let client else { throw ClusteringFailure("The clustering backend is unavailable.") }
++        let status = try await client.bootstrap(token: connection.bootstrapToken)
++        try check(operation)
++        modelsReady = status.modelsReady
++        modelMessage = status.modelMessage
++        guard connect else { return }
++        guard let endpoint = store.apiEndpoint, let token = store.apiToken else { throw ClusteringFailure("Footage Review's API is not ready.") }
++        _ = try await client.connect(endpoint: endpoint, token: token)
++        try check(operation)
++    }
++
++    private func drive(_ operation: UUID, resumeAdoptedCluster: Bool = false) async throws {
++        guard let client else { throw ClusteringFailure("The clustering backend is unavailable.") }
++        while let saved = run {
++            try check(operation)
++            let job = try await client.job(saved.jobID)
++            try check(operation)
++            publish(job)
++            switch job.status {
++            case "completed":
++                try await refreshWorkspace(operation)
++                if job.kind == "export" {
++                    // A prior POST may have succeeded before its reply/receipt was saved.
++                    // Adopt durable work before deciding whether any new job is needed.
++                    if let existing = workspace?.jobs.last(where: { $0.kind == "cluster" }) {
++                        run?.jobID = existing.id
++                        run?.stage = "cluster"
++                        try persistRun()
++                        if existing.status == "paused", resumeAdoptedCluster {
++                            _ = try await client.control(existing.id, action: "resume")
++                            try check(operation)
++                        }
++                        continue
++                    }
++                    statusText = "Starting local face clustering…"
++                    let created: ClusterJobCreated = try await client.request("POST", "/api/workspaces/\(ClusteringAPIClient.segment(saved.workspaceID))/cluster", body: .object([
++                        "threshold": .number(saved.threshold), "min_cluster_size": .number(Double(saved.minimum)),
++                    ]))
++                    try check(operation)
++                    run?.jobID = created.jobID
++                    run?.stage = "cluster"
++                    try persistRun()
++                    continue
++                }
++                run?.stage = "completed"
++                run?.candidateIDs = workspace?.groups.filter { $0.origin != "existing" }.map(\.id) ?? []
++                updateReviewGroups()
++                try persistRun()
++                statusText = reviewGroups.isEmpty ? "Clustering finished with no new suggestions. Review crop quality or try a different threshold." : "\(reviewGroups.count.formatted()) suggested groups ready for review."
++                canPause = false
++                canResume = false
++                canCancel = false
++                return
++            case "paused":
++                try persistRun()
++                return
++            case "failed", "cancelled":
++                run?.stage = job.status
++                try persistRun()
++                try await refreshWorkspace(operation)
++                if job.status == "failed" { throw ClusteringFailure(job.error ?? "The clustering job failed.") }
++                return
++            default:
++                try await Task.sleep(for: .milliseconds(400))
++            }
++        }
++    }
++
++    private func refreshWorkspace(_ operation: UUID) async throws {
++        guard let client, let run else { return }
++        let value = try await client.workspace(run.workspaceID)
++        try check(operation)
++        workspace = value
++        updateReviewGroups()
++        if preparedImport == nil { preparedImport = value.imports.first { ["prepared", "uncertain", "rejected"].contains($0.status) } }
++    }
++
++    private func updateReviewGroups() {
++        let ids = Set(run?.candidateIDs ?? [])
++        reviewGroups = workspace?.groups.filter { ids.contains($0.id) || $0.origin != "existing" } ?? []
++    }
++
++    private func publish(_ job: ClusterJob) {
++        activeJob = job
++        completed = job.completed
++        total = job.total
++        statusText = job.error ?? job.phase
++        canPause = ["queued", "running"].contains(job.status)
++        canResume = job.status == "paused"
++        canCancel = job.isActive
++    }
++
++    private func handle(_ error: any Error, operation: UUID) {
++        guard operation == generation, !(error is CancellationError) else { return }
++        if activeJob?.isActive == true || run?.stage == "export" || run?.stage == "cluster" {
++            canPause = false
++            canResume = true
++            canCancel = true
++        }
++        fail(error)
++    }
++
++    private func fail(_ error: any Error) {
++        errorMessage = (error as? LocalizedError)?.errorDescription ?? "The clustering operation could not finish. Retry after checking Settings."
++        statusText = "Clustering needs attention."
++    }
++
++    private func readRun() throws -> NativeClusteringRun? {
++        guard let receiptURL, FileManager.default.fileExists(atPath: receiptURL.path) else { return nil }
++        let data = try Data(contentsOf: receiptURL)
++        guard data.count <= 64 * 1024 else { throw ClusteringFailure("Saved clustering state is too large. Preserve NativeRun.json and check the library.") }
++        do { return try JSONDecoder().decode(NativeClusteringRun.self, from: data) }
++        catch { throw ClusteringFailure("Saved clustering state could not be read. Preserve NativeRun.json before starting a fresh run.") }
++    }
++
++    private func persistRun() throws {
++        guard let run, let dataDirectory, let receiptURL else { return }
++        try FileManager.default.createDirectory(at: dataDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
++        let data = try JSONEncoder().encode(run)
++        try data.write(to: receiptURL, options: .atomic)
++        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: receiptURL.path)
++    }
++}
+--- /dev/null
++++ b/Sources/FootageReview/Services/ManagedClusteringBackend.swift
+@@ -0,0 +1,166 @@
++import CryptoKit
++import Foundation
++
++struct ManagedClusteringConnection: Sendable {
++    let endpoint: URL
++    let bootstrapToken: String
++}
++
++private struct ClusteringReadiness: Decodable, Sendable {
++    let `protocol`: Int
++    let instanceID: String
++    let endpoint: String
++    enum CodingKeys: String, CodingKey { case `protocol`, endpoint; case instanceID = "instance_id" }
++}
++
++private actor ClusteringReadinessMailbox {
++    private var bytes = Data()
++    private var readiness: ClusteringReadiness?
++    private var failed = false
++
++    func receive(_ data: Data) {
++        guard readiness == nil, !failed else { return }
++        guard !data.isEmpty, bytes.count + data.count <= 8192 else { failed = true; return }
++        bytes.append(data)
++        if let newline = bytes.firstIndex(of: 10) {
++            readiness = try? JSONDecoder().decode(ClusteringReadiness.self, from: bytes.prefix(upTo: newline))
++            if readiness == nil { failed = true }
++        }
++    }
++
++    func result() throws -> ClusteringReadiness? {
++        if failed { throw ClusteringFailure("The clustering backend did not complete its startup handshake. Check that the selected repository is prepared.") }
++        return readiness
++    }
++}
++
++/// Owns exactly one child Process. No PID adoption and no shell invocation.
++@MainActor
++final class ManagedClusteringBackend {
++    var onExit: (@MainActor @Sendable () -> Void)?
++    private var process: Process?
++    private var input: FileHandle?
++    private var output: FileHandle?
++    private var connection: ManagedClusteringConnection?
++    private var repository: URL?
++    private var dataDirectory: URL?
++
++    var isRunning: Bool { process?.isRunning == true }
++
++    func start(repository: URL, dataDirectory: URL) async throws -> ManagedClusteringConnection {
++        if isRunning, self.repository == repository, self.dataDirectory == dataDirectory, let connection {
++            return connection
++        }
++        await stop()
++        guard !isRunning else { throw ClusteringFailure("The previous clustering backend is still shutting down. Try again shortly.") }
++        let backend = repository.appendingPathComponent("backend", isDirectory: true)
++        let python = backend.appendingPathComponent(".venv/bin/python")
++        guard FileManager.default.isExecutableFile(atPath: python.path),
++              FileManager.default.fileExists(atPath: backend.appendingPathComponent("app/managed.py").path) else {
++            throw ClusteringFailure("Prepare Cluster Grouper in the selected folder with make setup and make models, then try again.")
++        }
++        try FileManager.default.createDirectory(at: dataDirectory, withIntermediateDirectories: true,
++                                                attributes: [.posixPermissions: 0o700])
++        let child = Process()
++        let stdin = Pipe()
++        let stdout = Pipe()
++        let mailbox = ClusteringReadinessMailbox()
++        let instance = UUID().uuidString
++        let token = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0).base64EncodedString() }
++        child.executableURL = python
++        child.arguments = ["-m", "app.managed"]
++        child.currentDirectoryURL = backend
++        var environment = ProcessInfo.processInfo.environment
++        // Keep the repository's model selection canonical; native state is private to this library.
++        environment.removeValue(forKey: "CLUSTER_DATA_DIR")
++        environment.removeValue(forKey: "CLUSTER_MODEL_DIR")
++        environment.removeValue(forKey: "PYTHONPATH")
++        environment.removeValue(forKey: "PYTHONHOME")
++        environment["PYTHONNOUSERSITE"] = "1"
++        environment["PYTHONUNBUFFERED"] = "1"
++        child.environment = environment
++        child.standardInput = stdin
++        child.standardOutput = stdout
++        child.standardError = FileHandle.nullDevice
++        child.terminationHandler = { [weak self] exited in
++            let pid = exited.processIdentifier
++            Task { @MainActor in
++                guard let self, self.process?.processIdentifier == pid,
++                      self.process?.isRunning != true else { return }
++                self.onExit?()
++            }
++        }
++        stdout.fileHandleForReading.readabilityHandler = { handle in
++            let data = handle.availableData
++            Task { await mailbox.receive(data) }
++        }
++        do {
++            try child.run()
++            try stdin.fileHandleForReading.close()
++            try stdout.fileHandleForWriting.close()
++            process = child
++            input = stdin.fileHandleForWriting
++            output = stdout.fileHandleForReading
++            self.repository = repository
++            self.dataDirectory = dataDirectory
++            let payload = ClusterJSON.object([
++                "protocol": .number(1), "instance_id": .string(instance),
++                "bootstrap_token": .string(token), "data_dir": .string(dataDirectory.path),
++            ])
++            var data = try JSONEncoder().encode(payload)
++            data.append(10)
++            try input?.write(contentsOf: data)
++            let deadline = ContinuousClock.now.advanced(by: .seconds(20))
++            while ContinuousClock.now < deadline {
++                try Task.checkCancellation()
++                guard child.isRunning else {
++                    throw ClusteringFailure("The clustering backend exited during startup. Check its dependencies and model setup in Settings.")
++                }
++                if let ready = try await mailbox.result() {
++                    guard ready.protocol == 1, ready.instanceID == instance,
++                          let endpoint = URL(string: ready.endpoint), ClusteringAPIClient.validEndpoint(endpoint) else {
++                        throw ClusteringFailure("The clustering backend returned an invalid startup identity.")
++                    }
++                    let connection = ManagedClusteringConnection(endpoint: endpoint, bootstrapToken: token)
++                    self.connection = connection
++                    return connection
++                }
++                try await Task.sleep(for: .milliseconds(50))
++            }
++            throw ClusteringFailure("The clustering backend took too long to start. Check its setup and try again.")
++        } catch {
++            await stop()
++            throw error
++        }
++    }
++
++    private static func shutdownDelay() async {
++        await Task.detached { try? await Task.sleep(for: .milliseconds(50)) }.value
++    }
++
++    func stop() async {
++        // EOF is the managed protocol's graceful shutdown signal. The worker checkpoints first.
++        try? input?.close()
++        input = nil
++        if let process {
++            let deadline = ContinuousClock.now.advanced(by: .seconds(12))
++            while process.isRunning && ContinuousClock.now < deadline {
++                await Self.shutdownDelay()
++            }
++            if process.isRunning {
++                process.terminate()
++                let terminationDeadline = ContinuousClock.now.advanced(by: .seconds(2))
++                while process.isRunning && ContinuousClock.now < terminationDeadline {
++                    await Self.shutdownDelay()
++                }
++            }
++        }
++        output?.readabilityHandler = nil
++        try? output?.close()
++        output = nil
++        if process?.isRunning != true { process = nil }
++        connection = nil
++        repository = nil
++        dataDirectory = nil
++    }
++}
+--- a/Sources/FootageReview/Services/ReviewHTTPServer.swift
++++ b/Sources/FootageReview/Services/ReviewHTTPServer.swift
+@@ -25,7 +25,8 @@
+         let parameters = NWParameters.tcp
+         let endpointPort = NWEndpoint.Port(rawValue: port)!
+         parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: endpointPort)
+-        let newListener = try NWListener(using: parameters, on: endpointPort)
++        // requiredLocalEndpoint already supplies the loopback address and port.
++        let newListener = try NWListener(using: parameters)
+         try queue.sync {
+             guard listener == nil else {
+                 throw APIProblem(status: 409, code: "already_running", message: "The API is already running.")
+--- a/Sources/FootageReview/Views/APIIntegrationView.swift
++++ /dev/null
+@@ -1,172 +0,0 @@
+-import AppKit
+-import SwiftUI
+-
+-@MainActor
+-struct APIIntegrationView: View {
+-    let store: ReviewStore
+-    @Environment(\.dismiss) private var dismiss
+-    @AppStorage("review.api.port") private var portText = "8765"
+-    @AppStorage("review.api.browserOrigin") private var allowedOrigin = ""
+-    @State private var copiedField: CopyField?
+-
+-    private enum CopyField: Equatable {
+-        case endpoint
+-        case token
+-    }
+-
+-    private var port: UInt16? {
+-        guard let value = UInt16(portText.trimmingCharacters(in: .whitespacesAndNewlines)), value >= 1024 else { return nil }
+-        return value
+-    }
+-
+-    private var isStarting: Bool { store.apiToken != nil && !store.apiRunning }
+-
+-    var body: some View {
+-        VStack(spacing: 0) {
+-            header
+-            Divider()
+-            Form {
+-                Section {
+-                    HStack {
+-                        Label(
+-                            store.apiRunning ? "Running on this Mac" : isStarting ? "Starting…" : "Stopped",
+-                            systemImage: store.apiRunning ? "checkmark.circle.fill" : "circle"
+-                        )
+-                        .foregroundStyle(store.apiRunning ? Color.green : Color.secondary)
+-                        Spacer()
+-                        if isStarting {
+-                            ProgressView().controlSize(.small)
+-                        }
+-                    }
+-
+-                    TextField("Port", text: $portText)
+-                        .monospacedDigit()
+-                        .disabled(store.apiRunning || isStarting)
+-                    if port == nil {
+-                        Text("Enter a port from 1024 to 65535.")
+-                            .font(.caption)
+-                            .foregroundStyle(.red)
+-                    }
+-                    TextField("Browser origin", text: $allowedOrigin, prompt: Text("Optional"))
+-                        .autocorrectionDisabled()
+-                        .disabled(store.apiRunning || isStarting)
+-                    Text("For a browser app, enter its origin, such as http://localhost:3000.")
+-                        .font(.caption)
+-                        .foregroundStyle(.secondary)
+-
+-                    HStack {
+-                        if store.apiRunning || isStarting {
+-                            Button("Stop API", systemImage: "stop.circle") {
+-                                store.stopAPI()
+-                                copiedField = nil
+-                            }
+-                        } else {
+-                            Button("Start API", systemImage: "play.circle") {
+-                                guard let port else { return }
+-                                copiedField = nil
+-                                let origin = allowedOrigin.trimmingCharacters(in: .whitespacesAndNewlines)
+-                                store.startAPI(port: port, allowedOrigin: origin.isEmpty ? nil : origin)
+-                            }
+-                            .buttonStyle(.borderedProminent)
+-                            .disabled(port == nil || isStarting || store.isLoadingLibrary || store.isImporting)
+-                        }
+-                        Spacer()
+-                    }
+-                } header: {
+-                    Text("Local API")
+-                }
+-
+-                if let endpoint = store.apiEndpoint, store.apiRunning {
+-                    Section("Connection") {
+-                        HStack(alignment: .firstTextBaseline) {
+-                            Text(endpoint)
+-                                .font(.system(.callout, design: .monospaced))
+-                                .textSelection(.enabled)
+-                            Spacer()
+-                            Button(copiedField == .endpoint ? "Copied" : "Copy Endpoint", systemImage: "doc.on.doc") {
+-                                copy(endpoint, field: .endpoint)
+-                            }
+-                        }
+-
+-                        HStack {
+-                            SecureField("Access token", text: .constant(store.apiToken ?? ""))
+-                                .textFieldStyle(.roundedBorder)
+-                                .privacySensitive()
+-                                .accessibilityLabel("API access token")
+-                                .disabled(true)
+-                            Button(copiedField == .token ? "Copied" : "Copy Token", systemImage: "key") {
+-                                if let token = store.apiToken { copy(token, field: .token) }
+-                            }
+-                            .disabled(store.apiToken == nil)
+-                        }
+-                        Text("Use the access token as a Bearer token in your client.")
+-                            .font(.caption)
+-                            .foregroundStyle(.secondary)
+-                    }
+-                }
+-
+-                if let message = store.apiMessage, !message.isEmpty {
+-                    Section {
+-                        Text(message)
+-                            .font(.callout)
+-                            .textSelection(.enabled)
+-                    }
+-                }
+-
+-                Section("Reviewed Groups") {
+-                    Text("Export appearances, review them in another app, then import group assignments.")
+-                    if let summary = store.apiLastImport, !summary.isEmpty {
+-                        Label(summary, systemImage: "arrow.down.doc")
+-                            .font(.callout)
+-                            .textSelection(.enabled)
+-                    } else {
+-                        Text("Reviewed groups will appear in the Groups sidebar after import.")
+-                            .font(.callout)
+-                            .foregroundStyle(.secondary)
+-                    }
+-                }
+-
+-                Text("The API listens on this Mac and is available while Footage Review is running.")
+-                    .font(.caption)
+-                    .foregroundStyle(.secondary)
+-            }
+-            .formStyle(.grouped)
+-            Divider()
+-            HStack {
+-                Spacer()
+-                Button("Done") { dismiss() }
+-                    .keyboardShortcut(.defaultAction)
+-            }
+-            .padding(16)
+-        }
+-        .frame(width: 560, height: 625)
+-        .onAppear {
+-            if let endpoint = store.apiEndpoint, let port = URLComponents(string: endpoint)?.port {
+-                portText = String(port)
+-            }
+-        }
+-    }
+-
+-    private var header: some View {
+-        HStack(spacing: 12) {
+-            Image(systemName: "arrow.left.arrow.right")
+-                .font(.title2)
+-                .foregroundStyle(.tint)
+-            VStack(alignment: .leading, spacing: 3) {
+-                Text("Integrations")
+-                    .font(.title2.weight(.semibold))
+-                Text("Connect a local review tool to your library.")
+-                    .font(.callout)
+-                    .foregroundStyle(.secondary)
+-            }
+-            Spacer()
+-        }
+-        .padding(20)
+-    }
+-
+-    private func copy(_ value: String, field: CopyField) {
+-        let pasteboard = NSPasteboard.general
+-        pasteboard.clearContents()
+-        if pasteboard.setString(value, forType: .string) { copiedField = field }
+-    }
+-}
+--- a/Sources/FootageReview/Views/AppearanceGrid.swift
++++ b/Sources/FootageReview/Views/AppearanceGrid.swift
+@@ -119,7 +119,7 @@
+     }
+ }
+ 
+-private struct CropThumbnail: View {
++struct CropThumbnail: View {
+     let url: URL
+     @State private var thumbnail: NSImage?
+ 
+--- /dev/null
++++ b/Sources/FootageReview/Views/ClusteringReviewView.swift
+@@ -0,0 +1,381 @@
++import AppKit
++import SwiftUI
++
++private struct ClusterReviewDraft: Equatable {
++    var name: String
++    var note: String
++    var members: Set<String>
++
++    init(_ group: ClusterGroup) {
++        name = group.name
++        note = group.note
++        members = Set(group.appearanceIDs)
++    }
++
++    func differs(from group: ClusterGroup) -> Bool {
++        name != group.name || note != group.note || members != Set(group.appearanceIDs)
++    }
++}
++
++@MainActor
++struct ClusteringReviewView: View {
++    let store: ReviewStore
++    let clustering: ClusteringCoordinator
++    @Environment(\.dismiss) private var dismiss
++    @State private var selectedID: String?
++    @State private var drafts: [String: ClusterReviewDraft] = [:]
++    @State private var reviewer = ""
++    @State private var working = false
++    @State private var requestCopied = false
++
++    private var selectedGroup: ClusterGroup? {
++        clustering.reviewGroups.first { $0.id == selectedID } ?? clustering.reviewGroups.first
++    }
++
++    private var approvedCount: Int {
++        clustering.reviewGroups.filter { $0.reviewed && $0.dirty }.count
++    }
++
++    private var approvedAssignments: Int {
++        clustering.reviewGroups.filter { $0.reviewed && $0.dirty }
++            .reduce(0) { $0 + $1.appearanceIDs.count }
++    }
++
++    private var importWithinBounds: Bool { approvedCount <= 100 && approvedAssignments <= 10000 }
++
++    private var unsavedDrafts: Bool {
++        clustering.reviewGroups.contains { group in drafts[group.id]?.differs(from: group) == true }
++    }
++
++    var body: some View {
++        VStack(spacing: 0) {
++            header
++            Divider()
++            if let error = clustering.errorMessage {
++                Label(error, systemImage: "exclamationmark.triangle")
++                    .font(.callout)
++                    .foregroundStyle(.red)
++                    .textSelection(.enabled)
++                    .frame(maxWidth: .infinity, alignment: .leading)
++                    .padding(16)
++            }
++            if let savedImport = clustering.preparedImport {
++                importPreview(savedImport)
++            } else if clustering.reviewGroups.isEmpty {
++                ContentUnavailableView {
++                    Label(clustering.canResume ? "Clustering is paused" : "No suggestions available", systemImage: "person.2.crop.square.stack")
++                } description: {
++                    Text(clustering.statusText)
++                    Text(clustering.canResume
++                         ? "Resume the saved run to finish comparing appearances. Completed work is retained."
++                         : "Crops that do not produce usable face features remain available for manual review in the library.")
++                }
++                .frame(maxWidth: .infinity, maxHeight: .infinity)
++            } else {
++                reviewLayout
++            }
++            Divider()
++            footer
++        }
++        .frame(minWidth: 900, idealWidth: 1040, minHeight: 650, idealHeight: 760)
++        .onAppear { selectedID = clustering.reviewGroups.first?.id }
++    }
++
++    private var header: some View {
++        VStack(alignment: .leading, spacing: 7) {
++            HStack {
++                Label("Review Face Suggestions", systemImage: "person.2.crop.square.stack")
++                    .font(.title2.weight(.semibold))
++                Spacer()
++                if let workspace = clustering.workspace {
++                    Text("Revision \(workspace.baseRevision)")
++                        .font(.caption.monospacedDigit())
++                        .foregroundStyle(.secondary)
++                }
++            }
++            Text("Compare every crop, correct membership, and approve the groups you want to keep. Similarity is not an identity probability.")
++                .font(.callout)
++                .foregroundStyle(.secondary)
++        }
++        .padding(20)
++    }
++
++    private var reviewLayout: some View {
++        HSplitView {
++            List(selection: $selectedID) {
++                ForEach(clustering.reviewGroups) { group in
++                    VStack(alignment: .leading, spacing: 3) {
++                        Label(group.name, systemImage: group.reviewed ? "checkmark.circle" : "circle")
++                            .lineLimit(1)
++                        Text("\(group.appearanceIDs.count.formatted()) appearances · \(groupState(group))")
++                            .font(.caption)
++                            .foregroundStyle(.secondary)
++                    }
++                    .padding(.vertical, 3)
++                    .tag(group.id)
++                }
++            }
++            .listStyle(.sidebar)
++            .frame(minWidth: 210, idealWidth: 250, maxWidth: 320)
++            if let group = selectedGroup {
++                ClusterSuggestionEditor(
++                    store: store,
++                    group: group,
++                    draft: draftBinding(group),
++                    disabled: working || clustering.isBusy,
++                    save: { save(group) },
++                    unapprove: { unapprove(group) },
++                    discard: { drafts[group.id] = nil }
++                )
++                .frame(minWidth: 540)
++            }
++        }
++    }
++
++    private func draftBinding(_ group: ClusterGroup) -> Binding<ClusterReviewDraft> {
++        Binding(
++            get: { drafts[group.id] ?? ClusterReviewDraft(group) },
++            set: { drafts[group.id] = $0 }
++        )
++    }
++
++    private func groupState(_ group: ClusterGroup) -> String {
++        if group.origin == "existing" && !group.dirty { return "Imported" }
++        if drafts[group.id]?.differs(from: group) == true { return "Unsaved edits" }
++        return group.reviewed ? "Approved locally" : "Needs review"
++    }
++
++    private func save(_ group: ClusterGroup) {
++        let draft = drafts[group.id] ?? ClusterReviewDraft(group)
++        let orderedMembers = group.appearanceIDs.filter { draft.members.contains($0) }
++        Task {
++            working = true
++            await clustering.saveReview(
++                group: group,
++                name: draft.name.trimmingCharacters(in: .whitespacesAndNewlines),
++                note: draft.note,
++                appearanceIDs: orderedMembers
++            )
++            if clustering.errorMessage == nil { drafts[group.id] = nil }
++            working = false
++        }
++    }
++
++    private func unapprove(_ group: ClusterGroup) {
++        Task {
++            working = true
++            await clustering.unapproveReview(group: group)
++            working = false
++        }
++    }
++
++    private func importPreview(_ savedImport: ClusterSavedImport) -> some View {
++        VStack(alignment: .leading, spacing: 14) {
++            HStack {
++                Label(importTitle(savedImport.status), systemImage: savedImport.status == "submitted" ? "checkmark.circle.fill" : "doc.text.magnifyingglass")
++                    .font(.headline)
++                Spacer()
++                Text(savedImport.id)
++                    .font(.caption.monospaced())
++                    .foregroundStyle(.secondary)
++                    .textSelection(.enabled)
++            }
++            Text("This saved request contains a fixed group membership and base revision. Later review edits do not change it. Groups absent from the request are preserved.")
++                .font(.callout)
++                .foregroundStyle(.secondary)
++            ScrollView([.horizontal, .vertical]) {
++                Text(savedImport.prettyPayload)
++                    .font(.system(.callout, design: .monospaced))
++                    .textSelection(.enabled)
++                    .frame(maxWidth: .infinity, alignment: .leading)
++                    .padding(14)
++            }
++            .background(.quaternary.opacity(0.35), in: .rect(cornerRadius: 8))
++            .accessibilityLabel("Saved group import request")
++            if let error = savedImport.error {
++                Label(error, systemImage: "exclamationmark.triangle")
++                    .foregroundStyle(.red)
++                    .textSelection(.enabled)
++            }
++            if savedImport.status == "uncertain" {
++                Text("The outcome is uncertain. Retry this saved request with its original import ID; do not prepare a different request to bypass the uncertainty.")
++                    .font(.callout)
++            } else if savedImport.status == "rejected" {
++                Text("The library rejected this request. Start a fresh clustering run and reconcile the current groups before preparing a new import.")
++                    .font(.callout)
++            } else if savedImport.status == "submitted" {
++                Label("Reviewed groups are saved in the library's Groups sidebar. Inspect the source clips there.", systemImage: "checkmark.circle")
++                    .foregroundStyle(.green)
++            }
++            HStack {
++                Button(requestCopied ? "Copied" : "Copy Request") {
++                    let pasteboard = NSPasteboard.general
++                    pasteboard.clearContents()
++                    requestCopied = pasteboard.setString(savedImport.prettyPayload, forType: .string)
++                }
++                Spacer()
++                Button("Back to Review") { clustering.dismissPreparedImport() }
++                    .disabled(working || clustering.isBusy || savedImport.status == "uncertain")
++                Button(savedImport.status == "uncertain" ? "Retry Saved Import" : "Import Reviewed Groups") {
++                    Task {
++                        working = true
++                        await clustering.submitPreparedImport()
++                        working = false
++                    }
++                }
++                .buttonStyle(.borderedProminent)
++                .disabled(working || clustering.isBusy || !["prepared", "uncertain"].contains(savedImport.status))
++            }
++        }
++        .padding(20)
++        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
++    }
++
++    private func importTitle(_ status: String) -> String {
++        switch status {
++        case "submitted": return "Import Accepted"
++        case "uncertain": return "Import Outcome Uncertain"
++        case "rejected": return "Import Needs Reconciliation"
++        default: return "Preview Saved Import"
++        }
++    }
++
++    private var footer: some View {
++        HStack(spacing: 12) {
++            if clustering.preparedImport == nil && !clustering.reviewGroups.isEmpty {
++                TextField("Reviewer name (optional)", text: $reviewer)
++                    .frame(maxWidth: 230)
++                Text(!importWithinBounds ? "Approve up to 100 groups and 10,000 assignments per import; mark other groups unreviewed."
++                     : unsavedDrafts ? "Save or discard edits before preparing an import."
++                     : "\(approvedCount.formatted()) approved changes · \(approvedAssignments.formatted()) assignments")
++                    .font(.caption)
++                    .foregroundStyle(importWithinBounds ? Color.secondary : Color.orange)
++                Spacer()
++                Button("Prepare Import") {
++                    Task {
++                        working = true
++                        requestCopied = false
++                        await clustering.prepareImport(reviewer: reviewer.trimmingCharacters(in: .whitespacesAndNewlines))
++                        working = false
++                    }
++                }
++                .disabled(working || clustering.isBusy || approvedCount == 0 || !importWithinBounds
++                          || unsavedDrafts || reviewer.count > 200)
++            } else {
++                Text("Suggestions stay local until you explicitly review and import them.")
++                    .font(.caption)
++                    .foregroundStyle(.secondary)
++                Spacer()
++            }
++            Button("Done") { dismiss() }
++                .keyboardShortcut(.cancelAction)
++                .disabled(working)
++        }
++        .padding(16)
++    }
++}
++
++@MainActor
++private struct ClusterSuggestionEditor: View {
++    let store: ReviewStore
++    let group: ClusterGroup
++    @Binding var draft: ClusterReviewDraft
++    let disabled: Bool
++    let save: () -> Void
++    let unapprove: () -> Void
++    let discard: () -> Void
++
++    private var imported: Bool { group.origin == "existing" && !group.dirty }
++    private var missingIDs: Set<String> { draft.members.subtracting(store.appearances.map(\.id)) }
++    private var validText: Bool {
++        !draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
++            && draft.name.count <= 120 && draft.note.count <= 4000
++    }
++
++    var body: some View {
++        Form {
++            Section("Group Review") {
++                TextField("Group name", text: $draft.name)
++                VStack(alignment: .leading, spacing: 5) {
++                    Text("Notes").font(.callout)
++                    TextEditor(text: $draft.note).frame(minHeight: 65, maxHeight: 105)
++                        .accessibilityLabel("Group review notes")
++                }
++                LabeledContent("Membership", value: "\(draft.members.count.formatted()) appearances")
++                if let score = group.similarity {
++                    LabeledContent("Minimum pair similarity", value: score.formatted(.number.precision(.fractionLength(3))))
++                }
++                if !validText {
++                    Text("Use a name of 1–120 characters and notes up to 4,000 characters.")
++                        .font(.caption).foregroundStyle(.red)
++                }
++                if imported {
++                    Label("Imported. Further group edits are available in the Groups sidebar.", systemImage: "checkmark.circle")
++                        .foregroundStyle(.secondary)
++                } else {
++                    HStack {
++                        Button("Discard Edits", action: discard)
++                            .disabled(!draft.differs(from: group))
++                        if group.reviewed {
++                            Button("Mark Unreviewed", action: unapprove)
++                        }
++                        Spacer()
++                        Button(group.reviewed && !draft.differs(from: group) ? "Approved Locally" : "Save Reviewed Group", action: save)
++                            .buttonStyle(.borderedProminent)
++                            .disabled(!validText || !missingIDs.isEmpty || (group.reviewed && !draft.differs(from: group)))
++                    }
++                }
++            }
++            .disabled(disabled || imported)
++
++            Section("Inspect Appearances") {
++                Text("Keep only the appearances you have checked. Remove uncertain matches before approving.")
++                    .font(.caption)
++                    .foregroundStyle(.secondary)
++                if !missingIDs.isEmpty {
++                    Label("\(missingIDs.count.formatted()) appearances are unavailable in the current library. Re-run clustering or remove these memberships before approval.", systemImage: "exclamationmark.triangle")
++                        .font(.caption)
++                        .foregroundStyle(.orange)
++                    Button("Remove Unavailable Memberships") { draft.members.subtract(missingIDs) }
++                        .disabled(disabled || imported)
++                }
++                memberGrid
++            }
++        }
++        .formStyle(.grouped)
++    }
++
++    private var memberGrid: some View {
++        let byID = Dictionary(uniqueKeysWithValues: store.appearances.map { ($0.id, $0) })
++        return ScrollView {
++            LazyVGrid(columns: [GridItem(.adaptive(minimum: 145, maximum: 200), spacing: 12)], spacing: 16) {
++                ForEach(group.appearanceIDs, id: \.self) { id in
++                    if let item = byID[id] {
++                        let clip = store.clip(for: item)
++                        VStack(alignment: .leading, spacing: 6) {
++                            CropThumbnail(url: store.cropURL(for: item))
++                                .frame(height: 135)
++                                .background(.quaternary.opacity(0.35), in: .rect(cornerRadius: 6))
++                            Toggle(isOn: Binding(
++                                get: { draft.members.contains(id) },
++                                set: { if $0 { draft.members.insert(id) } else { draft.members.remove(id) } }
++                            )) {
++                                Text(clip?.camera ?? "Appearance").lineLimit(1)
++                            }
++                            .toggleStyle(.checkbox)
++                            .accessibilityLabel("Include appearance \(id), \(clip?.camera ?? "video clip"), \(formatOffset(item.seconds)) into clip")
++                            .disabled(disabled || imported)
++                            Text("\(clip?.date ?? "") \(clip?.clock ?? "") · +\(formatOffset(item.seconds))")
++                                .font(.caption2.monospacedDigit())
++                                .foregroundStyle(.secondary)
++                                .lineLimit(2)
++                        }
++                        .opacity(draft.members.contains(id) ? 1 : 0.5)
++                    }
++                }
++            }
++            .padding(.vertical, 8)
++        }
++        .frame(minHeight: 170, idealHeight: 300, maxHeight: 380)
++    }
++}
+--- /dev/null
++++ b/Sources/FootageReview/Views/ClusteringStatusView.swift
+@@ -0,0 +1,52 @@
++import SwiftUI
++
++@MainActor
++struct ClusteringStatusView: View {
++    let clustering: ClusteringCoordinator
++    let review: () -> Void
++
++    var body: some View {
++        VStack(alignment: .leading, spacing: 7) {
++            HStack(spacing: 10) {
++                Label("Face Clustering", systemImage: "person.2.crop.square.stack")
++                    .font(.callout.weight(.semibold))
++                Spacer()
++                if clustering.total > 0 {
++                    Text("\(clustering.completed.formatted()) of \(clustering.total.formatted())")
++                        .monospacedDigit()
++                }
++                if clustering.canPause {
++                    Button("Pause") { Task { await clustering.pause() } }
++                }
++                if clustering.canResume {
++                    Button("Resume") { Task { await clustering.resume() } }
++                }
++                if clustering.canCancel {
++                    Button("Cancel") { Task { await clustering.cancel() } }
++                }
++                if clustering.hasSavedRun || clustering.workspace != nil {
++                    Button("Review Suggestions", action: review)
++                        .disabled(clustering.isBusy)
++                }
++            }
++            if clustering.isBusy && clustering.total > 0 {
++                ProgressView(value: Double(clustering.completed), total: Double(max(1, clustering.total)))
++                    .accessibilityLabel("Clustering progress")
++            }
++            Text(clustering.statusText)
++                .font(.caption)
++                .foregroundStyle(.secondary)
++                .textSelection(.enabled)
++            if let message = clustering.errorMessage {
++                Label(message, systemImage: "exclamationmark.triangle")
++                    .font(.callout)
++                    .foregroundStyle(.red)
++                    .textSelection(.enabled)
++            }
++        }
++        .controlSize(.small)
++        .padding(.horizontal, 20)
++        .padding(.vertical, 10)
++        .background(.bar)
++    }
++}
+--- a/Sources/FootageReview/Views/ContentView.swift
++++ b/Sources/FootageReview/Views/ContentView.swift
+@@ -5,6 +5,8 @@
+ @MainActor
+ struct ContentView: View {
+     let store: ReviewStore
++    let settings: ReviewSettings
++    let clustering: ClusteringCoordinator
+ 
+     @State private var section: ReviewSection? = .appearances
+     @State private var filters = ReviewFilters()
+@@ -15,7 +17,7 @@
+     @State private var preview: ClipPreview?
+     @State private var showInspector = false
+     @State private var showImporter = false
+-    @State private var showIntegrations = false
++    @State private var showClusteringReview = false
+     @State private var groupDraft: GroupDraft?
+     @State private var displayedError: String?
+ 
+@@ -48,6 +50,16 @@
+                 } else if let progress = store.scanProgress {
+                     ScanStatusView(progress: progress, isScanning: store.isScanning)
+                 }
++                if clustering.isBusy || clustering.hasSavedRun || clustering.errorMessage != nil {
++                    ClusteringStatusView(clustering: clustering) {
++                        Task {
++                            if clustering.workspace == nil {
++                                await clustering.openSavedRun(store: store, settings: settings)
++                            }
++                            if clustering.workspace != nil { showClusteringReview = true }
++                        }
++                    }
++                }
+                 Divider()
+                 if store.clips.isEmpty {
+                     importEmptyState
+@@ -122,12 +134,27 @@
+                         .disabled(!canStartScan || requested.isEmpty)
+                         .help("Review the current scope and reuse available scan results")
+                     }
+-                    Button {
+-                        showIntegrations = true
++                    Menu {
++                        Button("Cluster Faces") {
++                            Task { await clustering.start(store: store, settings: settings) }
++                        }
++                        if clustering.hasSavedRun {
++                            Button("Start New Clustering Run") {
++                                Task { await clustering.startNewRun(store: store, settings: settings) }
++                            }
++                        }
+                     } label: {
+-                        Label("Integrations", systemImage: "arrow.left.arrow.right")
+-                    }
+-                    .help("Connect an external review tool")
++                        Label("Cluster Faces", systemImage: "person.2.crop.square.stack")
++                    } primaryAction: {
++                        Task { await clustering.start(store: store, settings: settings) }
++                    }
++                    .disabled(clustering.isBusy || store.isLoadingLibrary || store.isImporting
++                              || store.isScanning || store.appearances.isEmpty)
++                    .help("Cluster detected faces across the library, or reopen saved clustering work")
++                    SettingsLink {
++                        Label("Settings", systemImage: "gearshape")
++                    }
++                    .help("Clustering preferences and local API settings")
+                     Button {
+                         showInspector.toggle()
+                     } label: {
+@@ -174,8 +201,8 @@
+                 return true
+             }
+         }
+-        .sheet(isPresented: $showIntegrations) {
+-            APIIntegrationView(store: store)
++        .sheet(isPresented: $showClusteringReview) {
++            ClusteringReviewView(store: store, clustering: clustering)
+         }
+     }
+ 
+--- /dev/null
++++ b/Sources/FootageReview/Views/IntegrationSettingsView.swift
+@@ -0,0 +1,122 @@
++import AppKit
++import SwiftUI
++
++@MainActor
++struct IntegrationSettingsView: View {
++    let store: ReviewStore
++    @Bindable var settings: ReviewSettings
++    let clustering: ClusteringCoordinator
++    @State private var copiedField: CopyField?
++
++    private enum CopyField: Equatable { case endpoint, token }
++    private var isStarting: Bool { store.apiToken != nil && !store.apiRunning }
++
++    var body: some View {
++        Form {
++            Section("Local Review API") {
++                LabeledContent("Status") {
++                    Label(
++                        store.apiRunning ? "Running on this Mac" : isStarting ? "Starting…" : "Stopped",
++                        systemImage: store.apiRunning ? "checkmark.circle.fill" : "circle"
++                    )
++                    .foregroundStyle(store.apiRunning ? Color.green : Color.secondary)
++                }
++                TextField("Port", value: $settings.apiPort, format: .number.grouping(.never))
++                    .monospacedDigit()
++                    .disabled(store.apiRunning || isStarting)
++                if settings.apiPortValue == nil {
++                    Text("Enter a port from 1024 to 65535.")
++                        .font(.caption)
++                        .foregroundStyle(.red)
++                }
++                TextField("Browser origin", text: $settings.apiBrowserOrigin, prompt: Text("Optional"))
++                    .autocorrectionDisabled()
++                    .disabled(store.apiRunning || isStarting)
++                if let issue = settings.originValidationMessage {
++                    Text(issue).font(.caption).foregroundStyle(.red)
++                }
++                Text("Leave the browser origin blank for built-in clustering. An external browser client needs its exact origin, including scheme, host and port.")
++                    .font(.caption)
++                    .foregroundStyle(.secondary)
++                HStack {
++                    if store.apiRunning || isStarting {
++                        Button("Stop API", systemImage: "stop.circle") {
++                            store.stopAPI()
++                            copiedField = nil
++                        }
++                        .disabled(clustering.isBusy || clustering.canResume)
++                    } else {
++                        Button("Start API", systemImage: "play.circle") {
++                            guard let port = settings.apiPortValue else { return }
++                            copiedField = nil
++                            store.startAPI(port: port, allowedOrigin: settings.apiOriginValue)
++                        }
++                        .buttonStyle(.borderedProminent)
++                        .disabled(settings.apiPortValue == nil || settings.originValidationMessage != nil
++                                  || isStarting || store.isLoadingLibrary || store.isImporting)
++                    }
++                    if isStarting { ProgressView().controlSize(.small) }
++                    Spacer()
++                }
++                if clustering.isBusy || clustering.canResume {
++                    Text("Finish or cancel clustering before stopping its review API connection.")
++                        .font(.caption)
++                        .foregroundStyle(.secondary)
++                }
++            }
++
++            if let endpoint = store.apiEndpoint, store.apiRunning {
++                Section("External Client Connection") {
++                    HStack(alignment: .firstTextBaseline) {
++                        Text(endpoint)
++                            .font(.system(.callout, design: .monospaced))
++                            .textSelection(.enabled)
++                        Spacer()
++                        Button(copiedField == .endpoint ? "Copied" : "Copy Endpoint", systemImage: "doc.on.doc") {
++                            copy(endpoint, field: .endpoint)
++                        }
++                    }
++                    HStack {
++                        SecureField("Access token", text: .constant(store.apiToken ?? ""))
++                            .textFieldStyle(.roundedBorder)
++                            .privacySensitive()
++                            .accessibilityLabel("API access token")
++                            .disabled(true)
++                        Button(copiedField == .token ? "Copied" : "Copy Token", systemImage: "key") {
++                            if let token = store.apiToken { copy(token, field: .token) }
++                        }
++                        .disabled(store.apiToken == nil)
++                    }
++                    Text("Tokens stay in memory and change when the API restarts. Built-in clustering connects automatically.")
++                        .font(.caption)
++                        .foregroundStyle(.secondary)
++                }
++            }
++            if let message = store.apiMessage, !message.isEmpty {
++                Section("API Message") {
++                    Text(message).font(.callout).textSelection(.enabled)
++                }
++            }
++            Section("Reviewed Groups") {
++                if let summary = store.apiLastImport, !summary.isEmpty {
++                    Label(summary, systemImage: "arrow.down.doc")
++                        .font(.callout)
++                        .textSelection(.enabled)
++                } else {
++                    Text("Groups you explicitly import appear in the Groups sidebar and are saved in this library.")
++                        .foregroundStyle(.secondary)
++                }
++                Text("The API listens only on this Mac while Footage Review is running.")
++                    .font(.caption)
++                    .foregroundStyle(.secondary)
++            }
++        }
++        .formStyle(.grouped)
++    }
++
++    private func copy(_ value: String, field: CopyField) {
++        let pasteboard = NSPasteboard.general
++        pasteboard.clearContents()
++        if pasteboard.setString(value, forType: .string) { copiedField = field }
++    }
++}
+--- /dev/null
++++ b/Sources/FootageReview/Views/ReviewSettingsView.swift
+@@ -0,0 +1,217 @@
++import AppKit
++import SwiftUI
++
++@MainActor
++struct ReviewSettingsView: View {
++    let store: ReviewStore
++    @Bindable var settings: ReviewSettings
++    let clustering: ClusteringCoordinator
++
++    var body: some View {
++        TabView(selection: $settings.selectedTab) {
++            general
++                .tabItem { Label("General", systemImage: "gearshape") }
++                .tag(ReviewSettingsTab.general)
++            ClusteringSettingsView(store: store, settings: settings, clustering: clustering)
++                .tabItem { Label("Clustering", systemImage: "person.2.crop.square.stack") }
++                .tag(ReviewSettingsTab.clustering)
++            IntegrationSettingsView(store: store, settings: settings, clustering: clustering)
++                .tabItem { Label("Integrations", systemImage: "arrow.left.arrow.right") }
++                .tag(ReviewSettingsTab.integrations)
++        }
++        .frame(width: 660, height: 610)
++    }
++
++    private var general: some View {
++        Form {
++            Section("Review Library") {
++                LabeledContent("Location") {
++                    Text(store.libraryURL.path)
++                        .lineLimit(3)
++                        .truncationMode(.middle)
++                        .textSelection(.enabled)
++                }
++                Button("Show Library in Finder", systemImage: "folder") {
++                    NSWorkspace.shared.activateFileViewerSelecting([store.libraryURL])
++                }
++                Text("Clips, scan receipts, reviewed groups, and local clustering work belong to this library.")
++                    .font(.caption)
++                    .foregroundStyle(.secondary)
++            }
++            Section("Local Processing") {
++                LabeledContent("Face detection", value: "Apple Vision")
++                LabeledContent("Similarity suggestions", value: "YuNet and SFace")
++                Text("Clustering compares existing detected appearances on this Mac. Source videos stay unchanged. Suggestions need your review before they are saved as groups.")
++                    .font(.callout)
++                    .foregroundStyle(.secondary)
++            }
++        }
++        .formStyle(.grouped)
++    }
++}
++
++@MainActor
++private struct ClusteringSettingsView: View {
++    let store: ReviewStore
++    @Bindable var settings: ReviewSettings
++    let clustering: ClusteringCoordinator
++    @State private var setupCheck = 0
++
++    private var environmentExists: Bool {
++        FileManager.default.isExecutableFile(
++            atPath: settings.repositoryURL.appendingPathComponent("backend/.venv/bin/python").path
++        )
++    }
++
++    private var sourceExists: Bool {
++        FileManager.default.fileExists(
++            atPath: settings.repositoryURL.appendingPathComponent("backend/app/managed.py").path
++        )
++    }
++
++    private var scopedAppearances: [Appearance] {
++        let clipIDs = Set(store.clips.filter {
++            (settings.scopeDate.isEmpty || $0.date == settings.scopeDate)
++                && (settings.scopeSource.isEmpty || $0.source == settings.scopeSource)
++                && (settings.scopeCamera.isEmpty || $0.camera == settings.scopeCamera)
++        }.map(\.id))
++        return store.appearances.filter { clipIDs.contains($0.clipID) }
++    }
++
++    private var ungroupedCount: Int {
++        let grouped = store.groups.reduce(into: Set<String>()) { $0.formUnion($1.appearanceIDs) }
++        return scopedAppearances.filter { !grouped.contains($0.id) }.count
++    }
++
++    var body: some View {
++        Form {
++            Section("Clustering Tool") {
++                HStack {
++                    TextField("Tool folder", text: $settings.repositoryPath)
++                        .autocorrectionDisabled()
++                        .disabled(clustering.isBackendRunning)
++                    Button("Choose…", action: chooseFolder)
++                        .disabled(clustering.isBackendRunning)
++                }
++                Label(
++                    environmentExists && sourceExists ? "Tool environment found" : "Tool setup required",
++                    systemImage: environmentExists && sourceExists ? "checkmark.circle" : "exclamationmark.triangle"
++                )
++                .foregroundStyle(environmentExists && sourceExists ? Color.secondary : Color.orange)
++                .id(setupCheck)
++                HStack {
++                    Button("Check Setup") { setupCheck += 1 }
++                    Button("Show Tool Folder") {
++                        NSWorkspace.shared.activateFileViewerSelecting([settings.repositoryURL])
++                    }
++                }
++                if !environmentExists || !sourceExists {
++                    Text("Choose the Cluster Grouper repository. Prepare its environment once with make setup and make models in that folder, then use Cluster Faces in the toolbar.")
++                        .font(.caption)
++                        .foregroundStyle(.secondary)
++                }
++            }
++
++            Section("Appearance Scope") {
++                Picker("Date", selection: $settings.scopeDate) {
++                    Text("All Dates").tag("")
++                    ForEach(options(\.date, selected: settings.scopeDate), id: \.self) { Text($0).tag($0) }
++                }
++                Picker("Source", selection: $settings.scopeSource) {
++                    Text("All Sources").tag("")
++                    ForEach(options(\.source, selected: settings.scopeSource), id: \.self) { Text($0).tag($0) }
++                }
++                Picker("Camera", selection: $settings.scopeCamera) {
++                    Text("All Cameras").tag("")
++                    ForEach(options(\.camera, selected: settings.scopeCamera), id: \.self) { Text($0).tag($0) }
++                }
++                LabeledContent("Detected appearances", value: scopedAppearances.count.formatted())
++                LabeledContent("Outside reviewed groups", value: ungroupedCount.formatted())
++                if scopedAppearances.count > 50000 {
++                    Label("Choose a narrower scope. One export supports at most 50,000 appearances.", systemImage: "exclamationmark.triangle")
++                        .font(.caption)
++                        .foregroundStyle(.orange)
++                }
++                Text("These settings define a new clustering run independently of the main window's filters and selection. Saved runs keep their original scope; start a new run to apply changes. Existing reviewed groups are preserved.")
++                    .font(.caption)
++                    .foregroundStyle(.secondary)
++                Text("Reviewed imports accept up to 100 groups and 10,000 appearance assignments per request. These import limits are separate from clustering scope.")
++                    .font(.caption)
++                    .foregroundStyle(.secondary)
++            }
++            .disabled(clustering.isBusy)
++
++            Section("Suggestions") {
++                VStack(alignment: .leading, spacing: 8) {
++                    HStack {
++                        Text("Minimum similarity")
++                        Spacer()
++                        Text(settings.similarityThreshold, format: .number.precision(.fractionLength(2)))
++                            .monospacedDigit()
++                    }
++                    Slider(value: $settings.similarityThreshold, in: 0...1, step: 0.01)
++                        .accessibilityLabel("Minimum cosine similarity")
++                    HStack {
++                        Text("More suggestions")
++                        Spacer()
++                        Text("Stricter matches")
++                    }
++                    .font(.caption)
++                    .foregroundStyle(.secondary)
++                }
++                Stepper(value: $settings.minimumClusterSize, in: 2...100) {
++                    LabeledContent("Minimum appearances per group", value: settings.minimumClusterSize.formatted())
++                }
++                Text("Similarity is a comparison score, not an identity probability. Every pair in a suggested group must meet the threshold.")
++                    .font(.caption)
++                    .foregroundStyle(.secondary)
++            }
++            .disabled(clustering.isBusy)
++
++            Section("Service and Models") {
++                LabeledContent("Clustering backend", value: clustering.isBackendRunning ? "Running for Footage Review" : "Stopped")
++                Label(
++                    clustering.modelsReady ? "Face models verified" : "Model readiness",
++                    systemImage: clustering.modelsReady ? "checkmark.shield" : "info.circle"
++                )
++                Text(clustering.modelMessage)
++                    .font(.caption)
++                    .foregroundStyle(.secondary)
++                if clustering.isBackendRunning {
++                    Button("Stop Clustering Service") {
++                        Task { await clustering.stopService() }
++                    }
++                    .disabled(clustering.isBusy)
++                }
++                Text("Footage Review starts its own local backend when needed and stops it on quit. Closing the app preserves completed work and pauses unfinished jobs.")
++                    .font(.caption)
++                    .foregroundStyle(.secondary)
++                if let error = clustering.errorMessage {
++                    Label(error, systemImage: "exclamationmark.triangle")
++                        .foregroundStyle(.red)
++                        .textSelection(.enabled)
++                }
++            }
++        }
++        .formStyle(.grouped)
++    }
++
++    private func chooseFolder() {
++        let panel = NSOpenPanel()
++        panel.canChooseFiles = false
++        panel.canChooseDirectories = true
++        panel.allowsMultipleSelection = false
++        panel.message = "Choose the Cluster Grouper repository containing its backend folder."
++        panel.directoryURL = settings.repositoryURL
++        if panel.runModal() == .OK, let url = panel.url {
++            settings.repositoryPath = url.path
++            setupCheck += 1
++        }
++    }
++
++    private func options(_ keyPath: KeyPath<ReviewClip, String>, selected: String) -> [String] {
++        var values = Set(store.clips.map { $0[keyPath: keyPath] }.filter { !$0.isEmpty })
++        if !selected.isEmpty { values.insert(selected) }
++        return values.sorted()
++    }
++}
+--- /dev/null
++++ b/Tests/FootageReviewTests/ClusteringRecoveryTests.swift
+@@ -0,0 +1,154 @@
++import Foundation
++import XCTest
++@testable import FootageReview
++
++final class ClusteringRecoveryTests: XCTestCase {
++    @MainActor
++    func testResumeAdoptsPausedClusterAfterUncertainHandoff() async throws {
++        let fixture = try await RecoveryFixture.make()
++        let coordinator = ClusteringCoordinator()
++        do {
++            coordinator.restore(store: fixture.store, settings: fixture.settings)
++            XCTAssertTrue(coordinator.canResume)
++            await coordinator.resume()
++            XCTAssertNil(coordinator.errorMessage, coordinator.errorMessage ?? "")
++            let workspace = try XCTUnwrap(coordinator.workspace)
++            let clusters = workspace.jobs.filter { $0.kind == "cluster" }
++            XCTAssertEqual(clusters.count, 1, "Recovery must adopt the existing cluster, not create another job")
++            XCTAssertEqual(clusters.first?.id, fixture.clusterID)
++            XCTAssertEqual(clusters.first?.status, "completed", "Explicit Resume must resume the adopted paused job")
++            let metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: fixture.receipt)) as? [String: Any]
++            XCTAssertEqual(metadata?["jobID"] as? String, fixture.clusterID)
++            XCTAssertEqual(metadata?["stage"] as? String, "completed")
++            await coordinator.shutdown()
++            fixture.clean()
++        } catch {
++            await coordinator.shutdown()
++            fixture.clean()
++            throw error
++        }
++    }
++
++    @MainActor
++    func testSettingsStopAllowsReopeningOwnedBackend() async throws {
++        let fixture = try await RecoveryFixture.make()
++        let coordinator = ClusteringCoordinator()
++        do {
++            coordinator.restore(store: fixture.store, settings: fixture.settings)
++            await coordinator.openSavedRun(store: fixture.store, settings: fixture.settings)
++            XCTAssertNil(coordinator.errorMessage, coordinator.errorMessage ?? "")
++            XCTAssertTrue(coordinator.isBackendRunning)
++            await coordinator.stopService()
++            XCTAssertFalse(coordinator.isBackendRunning)
++            XCTAssertFalse(coordinator.isBusy)
++            XCTAssertTrue(coordinator.hasSavedRun)
++            await coordinator.openSavedRun(store: fixture.store, settings: fixture.settings)
++            XCTAssertNil(coordinator.errorMessage, coordinator.errorMessage ?? "")
++            XCTAssertTrue(coordinator.isBackendRunning, "Settings stop must not permanently disable later starts")
++            XCTAssertEqual(coordinator.workspace?.id, fixture.workspaceID)
++            await coordinator.shutdown()
++            fixture.clean()
++        } catch {
++            await coordinator.shutdown()
++            fixture.clean()
++            throw error
++        }
++    }
++}
++
++@MainActor
++private struct RecoveryFixture {
++    let library: URL
++    let store: ReviewStore
++    let settings: ReviewSettings
++    let suite: String
++    let workspaceID: String
++    let clusterID: String
++    let receipt: URL
++
++    static func make() async throws -> Self {
++        guard let path = ProcessInfo.processInfo.environment["CLUSTER_NATIVE_E2E_REPOSITORY"] else {
++            throw XCTSkip("Set CLUSTER_NATIVE_E2E_REPOSITORY to exercise actual managed-process recovery.")
++        }
++        let repository = URL(fileURLWithPath: path, isDirectory: true)
++        let library = FileManager.default.temporaryDirectory.appendingPathComponent("native-cluster-recovery-" + UUID().uuidString, isDirectory: true)
++        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
++        let store = ReviewStore(libraryURL: library)
++        let snapshot = try store.apiSnapshot()
++        let suite = "local.footage.review.recovery." + UUID().uuidString
++        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
++        let settings = ReviewSettings(defaults: defaults)
++        settings.repositoryPath = repository.path
++        let dataDirectory = library.appendingPathComponent("Clustering", isDirectory: true)
++        let setup = ManagedClusteringBackend()
++        do {
++            _ = try await setup.start(repository: repository, dataDirectory: dataDirectory)
++            await setup.stop()
++        } catch {
++            await setup.stop()
++            defaults.removePersistentDomain(forName: suite)
++            try? FileManager.default.removeItem(at: library)
++            throw error
++        }
++        let workspaceID = UUID().uuidString
++        let exportID = UUID().uuidString
++        let clusterID = UUID().uuidString
++        // Seed a durable backend state that can occur when the cluster POST reply is lost.
++        // This only writes the temporary fixture database, never an operator's library.
++        let script = #"""
++import sys
++from pathlib import Path
++from app.config import Settings
++from app.database import make_database, Workspace, Job
++engine,sessions=make_database(Settings(data_dir=Path(sys.argv[1])))
++with sessions.begin() as db:
++    db.add(Workspace(id=sys.argv[2],name='Recovery fixture',library_id=sys.argv[3],base_revision=int(sys.argv[6]),export_complete=True))
++    db.flush()
++    db.add(Job(id=sys.argv[4],workspace_id=sys.argv[2],kind='export',status='completed',phase='Export complete',completed=0,total=0,checkpoint={}))
++    db.add(Job(id=sys.argv[5],workspace_id=sys.argv[2],kind='cluster',status='paused',phase='Interrupted after handoff',completed=0,total=0,checkpoint={'threshold':0.55,'min_cluster_size':2}))
++engine.dispose()
++"""#
++        let process = Process()
++        process.executableURL = repository.appendingPathComponent("backend/.venv/bin/python")
++        process.currentDirectoryURL = repository.appendingPathComponent("backend")
++        process.arguments = ["-c", script, dataDirectory.path, workspaceID, snapshot.libraryID, exportID, clusterID, String(snapshot.revision)]
++        process.standardOutput = FileHandle.nullDevice
++        process.standardError = FileHandle.nullDevice
++        try process.run()
++        process.waitUntilExit()
++        guard process.terminationStatus == 0 else { throw ClusteringFailure("Could not seed the temporary recovery fixture") }
++        let receipt = dataDirectory.appendingPathComponent("NativeRun.json")
++        let metadata: [String: Any] = ["workspaceID":workspaceID,"jobID":exportID,"stage":"export","threshold":0.55,"minimum":2,"candidateIDs":[]]
++        try JSONSerialization.data(withJSONObject: metadata).write(to: receipt, options: .atomic)
++        // Native API startup is still driven by the coordinator in the Resume test.
++        settings.apiPort = try availablePort()
++        return Self(library: library, store: store, settings: settings, suite: suite,
++                    workspaceID: workspaceID, clusterID: clusterID, receipt: receipt)
++    }
++
++    func clean() {
++        store.stopAPI()
++        UserDefaults.standard.removePersistentDomain(forName: suite)
++        try? FileManager.default.removeItem(at: library)
++    }
++
++    private static func availablePort() throws -> Int {
++        let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
++        guard descriptor >= 0 else { throw ClusteringFailure("Cannot create a test listener") }
++        defer { Darwin.close(descriptor) }
++        var address = sockaddr_in()
++        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
++        address.sin_family = sa_family_t(AF_INET)
++        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
++        let bound = withUnsafePointer(to: &address) {
++            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
++        }
++        guard bound == 0 else { throw ClusteringFailure("Cannot bind a test listener") }
++        var size = socklen_t(MemoryLayout<sockaddr_in>.size)
++        let value = withUnsafeMutablePointer(to: &address) {
++            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(descriptor, $0, &size) }
++        }
++        guard value == 0 else { throw ClusteringFailure("Cannot read a test listener") }
++        return Int(UInt16(bigEndian: address.sin_port))
++    }
++}
+--- /dev/null
++++ b/Tests/FootageReviewTests/ClusteringServiceTests.swift
+@@ -0,0 +1,33 @@
++import Foundation
++import Testing
++@testable import FootageReview
++
++@Suite("Clustering service boundaries")
++@MainActor
++struct ClusteringServiceTests {
++    @Test func rejectsNonlocalAndCredentialEndpoints() {
++        let rejected = ["https://127.0.0.1:8000", "http://localhost:8000", "http://example.com:8000", "http://127.0.0.1:8000/path", "http://token@127.0.0.1:8000", "http://127.0.0.1:8000?secret=value"]
++        for value in rejected { #expect(!ClusteringAPIClient.validEndpoint(URL(string: value)!)) }
++        #expect(ClusteringAPIClient.validEndpoint(URL(string: "http://127.0.0.1:12345")!))
++        #expect(ClusteringAPIClient.segment("a/b?#%") == "a%2Fb%3F%23%25")
++    }
++
++    @Test func decodesOriginalIDsAndCompleteMembership() throws {
++        let bytes = Data(#"{"id":"workspace","name":"Native review","library_id":"original-library","base_revision":7,"appearance_count":2,"export_complete":true,"groups":[{"id":"original-group","name":"Review","note":"Keep all members","appearance_ids":["original-1","outside-filter"],"origin":"existing","reviewed":true,"dirty":false,"similarity":null}],"jobs":[{"id":"job","workspace_id":"workspace","kind":"cluster","status":"paused","phase":"Paused","completed":1,"total":2,"error":null}],"imports":[]}"#.utf8)
++        let value = try JSONDecoder().decode(ClusterWorkspace.self, from: bytes)
++        #expect(value.libraryID == "original-library")
++        #expect(value.baseRevision == 7)
++        #expect(value.groups.first?.appearanceIDs == ["original-1", "outside-filter"])
++        #expect(value.jobs.first?.workspaceID == value.id)
++        #expect(value.jobs.first?.isActive == true)
++    }
++
++    @Test func savedImportPreviewKeepsIdentityAndRevision() throws {
++        let bytes = Data(#"{"id":"saved-import","status":"uncertain","payload":{"import_id":"saved-import","base_revision":7,"groups":[]},"response":null,"error":"Response lost","created_at":"2026-11-08T00:00:00Z"}"#.utf8)
++        let saved = try JSONDecoder().decode(ClusterSavedImport.self, from: bytes)
++        let preview = try JSONDecoder().decode(ClusterJSON.self, from: Data(saved.prettyPayload.utf8))
++        #expect(saved.status == "uncertain")
++        #expect(preview == saved.payload)
++        #expect(saved.id == "saved-import")
++    }
++}
+--- /dev/null
++++ b/Tests/FootageReviewTests/NativeClusteringRoundTripTests.swift
+@@ -0,0 +1,137 @@
++import Darwin
++import Foundation
++import XCTest
++@testable import FootageReview
++
++final class NativeClusteringRoundTripTests: XCTestCase {
++    /// Opt-in actual-model test. Inputs are public sample crops, never private footage.
++    @MainActor
++    func testOneClickRunsOwnedBackendAndImportsOnlyReviewedGroups() async throws {
++        let environment = ProcessInfo.processInfo.environment
++        guard let repository = environment["CLUSTER_NATIVE_E2E_REPOSITORY"],
++              let assetPath = environment["CLUSTER_NATIVE_E2E_ASSETS"] else {
++            throw XCTSkip("Set CLUSTER_NATIVE_E2E_REPOSITORY and CLUSTER_NATIVE_E2E_ASSETS for the actual-model round trip.")
++        }
++        let assets = URL(fileURLWithPath: assetPath, isDirectory: true)
++        let library = FileManager.default.temporaryDirectory
++            .appendingPathComponent("footage-native-roundtrip-" + UUID().uuidString, isDirectory: true)
++        try Self.writeFixture(library: library, assets: assets)
++        if let target = environment["CLUSTER_NATIVE_E2E_GUI_FIXTURE"] {
++            try Self.writeFixture(library: URL(fileURLWithPath: target, isDirectory: true), assets: assets)
++        }
++        let suite = "local.footage.review.roundtrip." + UUID().uuidString
++        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
++        defer {
++            defaults.removePersistentDomain(forName: suite)
++            try? FileManager.default.removeItem(at: library)
++        }
++        let settings = ReviewSettings(defaults: defaults)
++        settings.repositoryPath = repository
++        settings.apiPort = try Self.availablePort()
++        settings.similarityThreshold = 0.55
++        settings.minimumClusterSize = 2
++        let store = ReviewStore(libraryURL: library)
++        let coordinator = ClusteringCoordinator()
++        do {
++            try await Self.eventually { !store.isLoadingLibrary && store.appearances.count == 2 }
++            XCTAssertFalse(store.apiRunning)
++            await coordinator.start(store: store, settings: settings)
++            XCTAssertNil(coordinator.errorMessage, coordinator.errorMessage ?? "")
++            XCTAssertTrue(store.apiRunning, "The native action must start its integration API")
++            XCTAssertTrue(coordinator.isBackendRunning, "The native action must own a live tool backend")
++            let workspace = try XCTUnwrap(coordinator.workspace)
++            XCTAssertTrue(workspace.exportComplete)
++            XCTAssertEqual(workspace.appearanceCount, 2)
++            XCTAssertTrue(workspace.jobs.contains { $0.kind == "cluster" && $0.status == "completed" })
++            let candidate = try XCTUnwrap(coordinator.reviewGroups.first)
++            XCTAssertEqual(Set(candidate.appearanceIDs), Set(store.appearances.map(\.id)))
++            XCTAssertFalse(candidate.reviewed)
++            XCTAssertTrue(store.groups.isEmpty, "Clustering must not silently import suggestions")
++
++            await coordinator.saveReview(group: candidate, name: "Reviewed public-sample fixture",
++                                         note: "Actual model validation; not private footage.",
++                                         appearanceIDs: candidate.appearanceIDs)
++            XCTAssertNil(coordinator.errorMessage, coordinator.errorMessage ?? "")
++            await coordinator.prepareImport(reviewer: "Native integration test")
++            XCTAssertNil(coordinator.errorMessage, coordinator.errorMessage ?? "")
++            let saved = try XCTUnwrap(coordinator.preparedImport)
++            XCTAssertEqual(saved.status, "prepared")
++            XCTAssertTrue(store.groups.isEmpty, "Preparing a request must not apply it")
++            await coordinator.submitPreparedImport()
++            XCTAssertNil(coordinator.errorMessage, coordinator.errorMessage ?? "")
++            XCTAssertEqual(coordinator.preparedImport?.id, saved.id)
++            XCTAssertEqual(coordinator.preparedImport?.status, "submitted")
++            XCTAssertEqual(store.groups.count, 1)
++            XCTAssertEqual(store.groups.first.flatMap { UUID(uuidString: $0.id) }, UUID(uuidString: candidate.id))
++            XCTAssertEqual(store.groups.first?.appearanceIDs, Set(candidate.appearanceIDs))
++            await coordinator.shutdown()
++            XCTAssertFalse(coordinator.isBackendRunning, "Quit cleanup must stop the owned backend")
++            store.stopAPI()
++        } catch {
++            await coordinator.shutdown()
++            store.stopAPI()
++            throw error
++        }
++    }
++
++    @MainActor
++    private static func eventually(_ condition: () -> Bool) async throws {
++        for _ in 0..<300 {
++            if condition() { return }
++            try await Task.sleep(for: .milliseconds(100))
++        }
++        throw ClusteringFailure("Fixture library did not restore its two detections.")
++    }
++
++    private struct FixtureLibrary: Encodable {
++        let clips: [ReviewClip]
++        let groups: [ReviewGroup] = []
++    }
++
++    private static func writeFixture(library: URL, assets: URL) throws {
++        let stateURL = library.appendingPathComponent("Library.json")
++        guard !FileManager.default.fileExists(atPath: stateURL.path) else {
++            throw ClusteringFailure("Refusing to overwrite an existing fixture library.")
++        }
++        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
++        let source = assets.appendingPathComponent("source.mp4")
++        let clip = ReviewClip(path: source.path, source: "Public sample", camera: "Validation",
++                              date: "2026-11-08", clock: "12:00:00")
++        let folder = UUID().uuidString
++        let cropFolder = library.appendingPathComponent("Crops").appendingPathComponent(folder)
++        try FileManager.default.createDirectory(at: cropFolder, withIntermediateDirectories: true)
++        var appearances: [Appearance] = []
++        for index in 1...2 {
++            let name = "crop-\(index).jpg"
++            try FileManager.default.copyItem(at: assets.appendingPathComponent(name), to: cropFolder.appendingPathComponent(name))
++            appearances.append(Appearance(id: "public-fixture-\(index)", clipID: clip.id,
++                                          seconds: Double(index), confidence: 0.98, cropFile: name))
++        }
++        let result = ScanResult(clipID: clip.id, stamp: try FileStamp.read(source), duration: 6,
++                                sampledFrames: 2, appearances: appearances, warnings: [])
++        try ScanArchive(library: library).write(StoredScan(result: result, cropFolder: folder))
++        try JSONEncoder().encode(FixtureLibrary(clips: [clip])).write(to: stateURL, options: .atomic)
++    }
++
++    private static func availablePort() throws -> Int {
++        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
++        guard descriptor >= 0 else { throw ClusteringFailure("Cannot allocate a test listener") }
++        defer { close(descriptor) }
++        var address = sockaddr_in()
++        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
++        address.sin_family = sa_family_t(AF_INET)
++        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
++        let bound = withUnsafePointer(to: &address) {
++            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
++                Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
++            }
++        }
++        guard bound == 0 else { throw ClusteringFailure("Cannot bind a test listener") }
++        var size = socklen_t(MemoryLayout<sockaddr_in>.size)
++        let read = withUnsafeMutablePointer(to: &address) {
++            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(descriptor, $0, &size) }
++        }
++        guard read == 0 else { throw ClusteringFailure("Cannot read a test listener") }
++        return Int(UInt16(bigEndian: address.sin_port))
++    }
++}
+--- /dev/null
++++ b/Tests/FootageReviewTests/ReviewSettingsTests.swift
+@@ -0,0 +1,62 @@
++import Foundation
++import XCTest
++@testable import FootageReview
++
++final class ReviewSettingsTests: XCTestCase {
++    @MainActor
++    func testExistingPortMigratesOnceWithOriginalValuePreserved() throws {
++        let domain = "local.footage.review.settings-test.\(UUID().uuidString)"
++        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
++        defer { defaults.removePersistentDomain(forName: domain) }
++        defaults.set("8877", forKey: "review.api.port")
++        let settings = ReviewSettings(defaults: defaults)
++        XCTAssertEqual(settings.apiPortValue, 8877)
++        XCTAssertEqual(defaults.string(forKey: "review.settings.migration.apiPort.v1"), "8877")
++        XCTAssertNil(defaults.object(forKey: "review.api.port"))
++
++        settings.apiPort = 9988
++        XCTAssertEqual(ReviewSettings(defaults: defaults).apiPortValue, 9988)
++        XCTAssertEqual(defaults.string(forKey: "review.settings.migration.apiPort.v1"), "8877")
++    }
++
++    @MainActor
++    func testClusteringPreferencesAndExactScopeSurviveReopening() throws {
++        let domain = "local.footage.review.settings-test.\(UUID().uuidString)"
++        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
++        defer { defaults.removePersistentDomain(forName: domain) }
++        let settings = ReviewSettings(defaults: defaults)
++        settings.repositoryPath = "/tmp/A tool folder"
++        settings.similarityThreshold = 0.72
++        settings.minimumClusterSize = 5
++        settings.scopeDate = "2026-05-25"
++        settings.scopeSource = "Blink"
++        settings.scopeCamera = "Front door"
++        let restored = ReviewSettings(defaults: defaults)
++        XCTAssertEqual(restored.repositoryURL.path, "/tmp/A tool folder")
++        XCTAssertEqual(restored.similarityThreshold, 0.72)
++        XCTAssertEqual(restored.minimumClusterSize, 5)
++        XCTAssertEqual(restored.scopeDate, "2026-05-25")
++        XCTAssertEqual(restored.scopeSource, "Blink")
++        XCTAssertEqual(restored.scopeCamera, "Front door")
++    }
++
++    @MainActor
++    func testAPISettingsValidatePortAndExactOrigin() throws {
++        let domain = "local.footage.review.settings-test.\(UUID().uuidString)"
++        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
++        defer { defaults.removePersistentDomain(forName: domain) }
++        let settings = ReviewSettings(defaults: defaults)
++        XCTAssertEqual(settings.apiPortValue, 8765)
++        XCTAssertNil(settings.apiOriginValue)
++        settings.apiPort = 80
++        XCTAssertNil(settings.apiPortValue)
++        settings.apiPort = 65535
++        XCTAssertEqual(settings.apiPortValue, 65535)
++        settings.apiBrowserOrigin = "http://localhost:3000"
++        XCTAssertNil(settings.originValidationMessage)
++        settings.apiBrowserOrigin = "http://localhost:3000/path"
++        XCTAssertNotNil(settings.originValidationMessage)
++        settings.apiBrowserOrigin = "http://user:secret@localhost:3000"
++        XCTAssertNotNil(settings.originValidationMessage)
++    }
++}
+--- a/script/build_and_run.sh
++++ b/script/build_and_run.sh
+@@ -12,7 +12,9 @@
+ app_name="Footage Review"
+ executable="FootageReview"
+ bundle_id="local.footage.review"
+-bundle="$project_dir/dist/Footage Review 1.2.app"
++app_version="1.3.0"
++app_build="4"
++bundle="$project_dir/dist/$app_name $app_version.app"
+ binary="$bundle/Contents/MacOS/$executable"
+ export CLANG_MODULE_CACHE_PATH="$project_dir/.build/clang-module-cache"
+ 
+@@ -23,13 +25,17 @@
+     exit 1
+ fi
+ 
+-swift build -c release
+-build_dir="$(swift build -c release --show-bin-path)"
++build_args=(-c release)
++if [[ "${FOOTAGE_REVIEW_DISABLE_PACKAGE_SANDBOX:-0}" == "1" ]]; then
++    build_args+=(--disable-sandbox)
++fi
++swift build "${build_args[@]}"
++build_dir="$(swift build "${build_args[@]}" --show-bin-path)"
+ mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
+ install -m 755 "$build_dir/$executable" "$binary"
+ install -m 644 "$project_dir/../intake/inventory.json" "$bundle/Contents/Resources/SeedInventory.json"
+ 
+-cat > "$bundle/Contents/Info.plist" <<'PLIST'
++cat > "$bundle/Contents/Info.plist" <<PLIST
+ <?xml version="1.0" encoding="UTF-8"?>
+ <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+ <plist version="1.0">
+@@ -39,9 +45,9 @@
+   <key>CFBundleName</key><string>Footage Review</string>
+   <key>CFBundleDisplayName</key><string>Footage Review</string>
+   <key>CFBundlePackageType</key><string>APPL</string>
+-  <key>CFBundleShortVersionString</key><string>1.2</string>
+-  <key>CFBundleVersion</key><string>3</string>
+-  <key>LSMinimumSystemVersion</key><string>14.0</string>
++  <key>CFBundleShortVersionString</key><string>$app_version</string>
++  <key>CFBundleVersion</key><string>$app_build</string>
++  <key>LSMinimumSystemVersion</key><string>26.0</string>
+   <key>NSPrincipalClass</key><string>NSApplication</string>
+   <key>NSHighResolutionCapable</key><true/>
+   <key>LSApplicationCategoryType</key><string>public.app-category.video</string>

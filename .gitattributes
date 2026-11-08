@@ -1,0 +1,2 @@
+# Unified patch context uses a single space for an empty source line.
+integrations/footage-review/native-integration.patch whitespace=-blank-at-eol

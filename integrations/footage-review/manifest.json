@@ -1,0 +1,90 @@
+{
+  "API.md": {
+    "before": "79fb1c6bd0c030321f818e012635193974db1018c5484da60bcc8db30f8bab62",
+    "after": "35547c47439cca97c73cf8338824d7ae6070fe93c16b0b9d39ff87cfdb6e8e85"
+  },
+  "Package.swift": {
+    "before": "3ab2e3cdafb5bf5e623d3802d29ded2a24940c93ef4c500f242344c61e9c3e06",
+    "after": "30ac554d145f3b00135461f9af6bdffa5bc90faf3fd35a1e8a41c34c1bd96de1"
+  },
+  "README.md": {
+    "before": "d621494732d8f4ff979a9d7bfdfdef1cd8db757039de1c9723a6f03427fec925",
+    "after": "26088ab078a2694273e8729d88543bbaa07224a398877af196e5483108a5bab1"
+  },
+  "Sources/FootageReview/App/FootageReviewApp.swift": {
+    "before": "997e5642068662002aed7f6b1172c2f8470f012bc5be9d3b481dfd55c6127dc3",
+    "after": "af4c1595d206ac67cba5a4ea1e4cf689dd5dc754923e9b6aceac4ebef68f2e52"
+  },
+  "Sources/FootageReview/Models/ClusteringModels.swift": {
+    "before": null,
+    "after": "c63ae244bf5868863aee39e066dd8cdd359eb72c1d9591e1e7850f92e0b76f9e"
+  },
+  "Sources/FootageReview/Models/ReviewSettings.swift": {
+    "before": null,
+    "after": "205101bfbf83c5f0811e0fe6abcafacc4488678940101f6d8218e8a67cb9f9dd"
+  },
+  "Sources/FootageReview/Services/ClusteringAPIClient.swift": {
+    "before": null,
+    "after": "0fd9f07d8e9cfe45b7da06442af3f1dd817b4a50457048411ee2b11339657b71"
+  },
+  "Sources/FootageReview/Services/ClusteringCoordinator.swift": {
+    "before": null,
+    "after": "07379bc8e376584af374aa14cf9fcea60c6d3384e53226016c9dfbd722cc4585"
+  },
+  "Sources/FootageReview/Services/ManagedClusteringBackend.swift": {
+    "before": null,
+    "after": "ec8456bc0f2b05a3cc55bb64905a09af1262a5cd39fa8c41b3820dadacca3c30"
+  },
+  "Sources/FootageReview/Services/ReviewHTTPServer.swift": {
+    "before": "840fb9d65e2b39f3afc024572da9d69017ec20f7a6f0b8ca92d72d26a928ea82",
+    "after": "583d46497e1532224611e0eff2513d07db80b17d2054e053291c5fc397e2d389"
+  },
+  "Sources/FootageReview/Views/APIIntegrationView.swift": {
+    "before": "f0bae9ed9544ce7041917b0e1c56224d62082ca0d31bd2cc7a66af6c7330f6de",
+    "after": null
+  },
+  "Sources/FootageReview/Views/AppearanceGrid.swift": {
+    "before": "a97de75821f3eb149967e739fcbb0eef44433e497ee32c53e999762535a634f4",
+    "after": "24189eccc3c043ea4a7a34b97824eeb01b16736cd2d8591f2ed3b88693cce22f"
+  },
+  "Sources/FootageReview/Views/ClusteringReviewView.swift": {
+    "before": null,
+    "after": "82f0d803242cbbe548ffdc78bfd17bbdab49bc4026fdff9f77290be35807996e"
+  },
+  "Sources/FootageReview/Views/ClusteringStatusView.swift": {
+    "before": null,
+    "after": "88afa1c0b44176bc92bc797183ea8f5110d663acc6f41bb6114562faf109fb3b"
+  },
+  "Sources/FootageReview/Views/ContentView.swift": {
+    "before": "d5256810ec38c62df117bca8aa2da63985b0f7a7454f2e87ef9d0956e27cd476",
+    "after": "65af8b0e769a53d313a44605f67060439db6a9a4a61ef41ab1381e192284f1dc"
+  },
+  "Sources/FootageReview/Views/IntegrationSettingsView.swift": {
+    "before": null,
+    "after": "a5c7fea25569f447d182f9e086a9522b05286aa633d0173f56ba2114d0a5979f"
+  },
+  "Sources/FootageReview/Views/ReviewSettingsView.swift": {
+    "before": null,
+    "after": "d370743d9060b38ec671570daaab9dd3014a4e06e93a29124ee2327c4724cf44"
+  },
+  "Tests/FootageReviewTests/ClusteringRecoveryTests.swift": {
+    "before": null,
+    "after": "c75ca2c029cfc10475715f482ca2947bc33d5cb82497d874a53426eb038ed134"
+  },
+  "Tests/FootageReviewTests/ClusteringServiceTests.swift": {
+    "before": null,
+    "after": "32951151ee4e87f5cf91f755aaa6b4f11cda4a2e37a13fddcc9651af554abc45"
+  },
+  "Tests/FootageReviewTests/NativeClusteringRoundTripTests.swift": {
+    "before": null,
+    "after": "3283a238b2b76af446060ec3bd0a01f6e72c5da061f826319abd6114d37da5d0"
+  },
+  "Tests/FootageReviewTests/ReviewSettingsTests.swift": {
+    "before": null,
+    "after": "7c99420fdf78266a9744a4768be5e4c18b99a74f4b82dc6db7d4b88c0c83cd9f"
+  },
+  "script/build_and_run.sh": {
+    "before": "8f71cf28ba6728281fdd44ce64d72ff9a5bd689962e964a20879998fe739e7b9",
+    "after": "0531e344dc63976b2d9430a54352d82b88a685ac01845ab34161de5e5c817c0c"
+  }
+}

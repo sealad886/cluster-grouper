@@ -1,0 +1,42 @@
+name: Release proposals
+
+"on":
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-please-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-pr:
+    # Opt-in requires a separate authorized repository-settings change.
+    # This job creates release PRs only; it never creates a tag or release.
+    if: vars.RELEASE_PLEASE_ENABLED == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out exact triggering revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check release metadata
+        # Do not bump again from a merged candidate that has not been tagged.
+        run: python3 scripts/check-release.py --require-baseline-tag
+      - name: Propose reviewed version changes
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0; bundled release-please 17.6.0
+        with:
+          token: ${{ github.token }}
+          target-branch: main
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
